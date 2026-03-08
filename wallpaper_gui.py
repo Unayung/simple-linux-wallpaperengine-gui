@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import re
 import pathlib
+import urllib.request
 import logging
 import argparse
 
@@ -17,52 +18,158 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QLabel, QLineEdit, QCheckBox, QSlider, QComboBox,
                              QStackedWidget, QListWidget, QListWidgetItem, QSystemTrayIcon,
                              QMenu, QFrame, QSizePolicy, QGraphicsDropShadowEffect,
-                             QStyledItemDelegate, QStyle, QStyleOptionSlider, QFileDialog)
+                             QStyledItemDelegate, QStyle, QStyleOptionSlider, QFileDialog,
+                             QScrollArea, QGridLayout, QSplitter, QTabBar, QToolButton,
+                             QSpacerItem)
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer, QRect, QPropertyAnimation, QEasingCurve, QVariant, QUrl
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QImage, QAction, QColor, QPainter, QDesktopServices
 from process_manager import WallpaperProcessManager
+from steamcmd_service import SteamCmdService, DownloadStatus
+from workshop_api import (WorkshopItem, SortOrder,
+                          CONTENT_RATING_TAGS, TYPE_TAGS, GENRE_TAGS,
+                          search_items, NoAPIKeyError, InvalidAPIKeyError, WorkshopAPIError)
 
 CONFIG_FILE = pathlib.Path(os.getenv("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))) / "linux-wallpaperengine-gui" / "wpe_gui_config.json"
 LOCALE_DIR = (pathlib.Path(__file__).parent / "locales").absolute()
 
-MACOS_DARK = """
-QMainWindow { background-color: #1E1E1E; }
-QWidget { color: #FFFFFF; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica, sans-serif; font-size: 13px; }
-#NavContainer { background-color: #262626; border-bottom: 1px solid #3A3A3A; }
-QListWidget#Sidebar { background-color: transparent; border: none; outline: none; font-size: 13px; font-weight: 500; }
-QListWidget#Sidebar::item { height: 32px; padding: 0 15px; margin: 9px 5px; border-radius: 6px; color: #9A9A9A; }
-QListWidget#Sidebar::item:selected { background-color: #3A3A3A; color: #FFFFFF; }
-QListWidget#Sidebar::item:hover:!selected { background-color: #2F2F2F; color: #FFFFFF; }
-QFrame.Card { background-color: #2D2D2D; border: 1px solid #3A3A3A; border-radius: 10px; }
-QLabel.CardTitle { font-weight: 600; font-size: 15px; color: #FFFFFF; margin-bottom: 8px; }
-QLineEdit, QComboBox { background-color: #000000; border: 1px solid #3A3A3A; border-radius: 6px; padding: 4px 8px; color: #FFFFFF; selection-background-color: #0A84FF; min-height: 22px; }
-QLineEdit:focus, QComboBox:focus { border: 1px solid #0A84FF; }
+# ── Stylesheet ──────────────────────────────────────────────────────────────
+STYLESHEET = """
+* { font-family: "Inter", "SF Pro Display", "Segoe UI", "Helvetica Neue", sans-serif; }
+
+QMainWindow { background-color: #1a1a1a; }
+
+/* ── Top Tab Bar ───────────────────────────────────── */
+QWidget#TopBar { background-color: #1a1a1a; border-bottom: 2px solid #0A84FF; }
+QPushButton#TabBtn {
+    background: transparent; border: 2px solid #0A84FF; border-bottom: none;
+    color: #888; font-size: 14px; font-weight: 600; padding: 8px 20px; min-width: 100px;
+}
+QPushButton#TabBtn:hover { color: #ddd; background: rgba(10,132,255,0.08); }
+QPushButton#TabBtnActive {
+    background: #0A84FF; border: 2px solid #0A84FF; border-bottom: none;
+    color: #fff; font-size: 14px; font-weight: 600; padding: 8px 20px; min-width: 100px;
+}
+QPushButton#BarButton {
+    background: transparent; border: 1px solid #3A3A3A;
+    color: #aaa; font-size: 12px; padding: 5px 12px; border-radius: 4px;
+}
+QPushButton#BarButton:hover { background: #2a2a2a; color: #fff; }
+
+/* ── Explorer Top Bar ──────────────────────────────── */
+QWidget#ExplorerBar { background-color: #1f1f1f; }
+QLineEdit#SearchField {
+    background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px;
+    padding: 5px 10px; color: #fff; min-height: 26px; font-size: 13px;
+}
+QLineEdit#SearchField:focus { border-color: #0A84FF; }
+
+/* ── Splitter & Panels ─────────────────────────────── */
+QSplitter::handle { background-color: #2a2a2a; width: 1px; }
+QWidget#LeftPanel { background-color: #1a1a1a; }
+QWidget#PreviewPanel { background-color: #1f1f1f; border-left: 1px solid #2a2a2a; }
+
+/* ── Wallpaper Grid ────────────────────────────────── */
+QListWidget#WallpaperGrid {
+    background-color: transparent; border: none; outline: none;
+}
+QListWidget#WallpaperGrid::item {
+    background-color: #222; border: 1px solid #333; border-radius: 4px;
+    margin: 6px; color: #fff; padding: 3px;
+}
+QListWidget#WallpaperGrid::item:selected { border: 2px solid #0A84FF; background-color: #2a2a2a; }
+QListWidget#WallpaperGrid::item:hover { background-color: #2d2d2d; border-color: #444; }
+
+/* ── Preview Panel ─────────────────────────────────── */
+QLabel#PreviewImage {
+    background-color: #111; border: 3px solid #fff; border-radius: 12px;
+}
+QLabel#PreviewTitle { font-size: 15px; font-weight: 600; color: #fff; }
+QLabel#PreviewMeta { font-size: 12px; color: #888; }
+QLabel#PreviewTag {
+    background-color: transparent; border: 1px solid #666; border-radius: 10px;
+    padding: 3px 8px; font-size: 11px; color: #ccc;
+}
+
+/* ── Properties Section ────────────────────────────── */
+QLabel#SectionDivider { font-size: 13px; color: #aaa; }
+
+/* ── Cards & Controls ──────────────────────────────── */
+QFrame.Card { background-color: #222; border: 1px solid #333; border-radius: 8px; }
+QLabel.CardTitle { font-weight: 600; font-size: 14px; color: #fff; }
+
+QPushButton#PrimaryBtn {
+    background-color: #0A84FF; color: white; border: none; border-radius: 5px;
+    padding: 7px 18px; font-weight: 600; font-size: 13px;
+}
+QPushButton#PrimaryBtn:hover { background-color: #0070E0; }
+QPushButton#PrimaryBtn:pressed { background-color: #005EC4; }
+
+QPushButton#SecBtn {
+    background-color: #333; color: #ddd; border: 1px solid #444; border-radius: 5px;
+    padding: 7px 18px; font-size: 13px;
+}
+QPushButton#SecBtn:hover { background-color: #3a3a3a; }
+
+QPushButton#DangerBtn {
+    background-color: #FF453A; color: white; border: none; border-radius: 5px;
+    padding: 7px 18px; font-weight: 600; font-size: 13px;
+}
+QPushButton#DangerBtn:hover { background-color: #D0342C; }
+
+QPushButton#LinkBtn {
+    background: transparent; border: none; color: #0A84FF;
+    font-size: 12px; text-decoration: underline; padding: 2px;
+}
+
+QLineEdit, QComboBox {
+    background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px;
+    padding: 5px 8px; color: #fff; min-height: 24px; font-size: 13px;
+}
+QLineEdit:focus, QComboBox:focus { border-color: #0A84FF; }
 QComboBox::drop-down { border: none; }
-QComboBox QAbstractItemView { background-color: #1E1E1E; border: 1px solid #3A3A3A; selection-background-color: #0A84FF; selection-color: #FFFFFF; color: #FFFFFF; outline: none; }
-QPushButton { background-color: #0A84FF; color: white; border: none; border-radius: 3px; padding: 6px 16px; font-weight: 650; font-size: 13px; min-height: 20px; }
-QPushButton:hover { background-color: #03447b; }
-QPushButton:pressed { background-color: #0062CC; }
-QPushButton#SecondaryButton { background-color: #3A3A3A; border: 1px solid #3A3A3A; color: #FFFFFF; }
-QPushButton#SecondaryButton:hover { background-color: #222222; }
-QPushButton#DangerButton { background-color: #FF453A; }
-QPushButton#DangerButton:hover { background-color: #D0342C; }
-QCheckBox { spacing: 8px; color: #FFFFFF; }
-QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #666666; background: #2D2D2D; }
+QComboBox QAbstractItemView {
+    background-color: #222; border: 1px solid #3a3a3a;
+    selection-background-color: #0A84FF; color: #fff; outline: none;
+}
+
+QCheckBox { spacing: 8px; color: #ddd; font-size: 13px; }
+QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #555; background: #2a2a2a; }
 QCheckBox::indicator:checked { background: #0A84FF; border-color: #0A84FF; }
-QSlider::groove:horizontal { border: 1px solid #3A3A3A; height: 5px; background: #3f7fcf; margin: 2px 0; border-radius: 2px; }
-QSlider::handle:horizontal { background: #FFFFFF; border: 1px solid #5c5c5c; width: 18px; height: 18px; margin: -8px 0; border-radius: 9px; }
-QListWidget#WallpaperGrid { background-color: transparent; border: none; outline: none; padding: 0px 0px 0px 0px; }
-QListWidget#WallpaperGrid::item { background-color: #111111; border: 1px solid #3A3A3A; border-radius: 3px; margin: 15px; color: #FFFFFF; padding: 5px; }
-QListWidget#WallpaperGrid::item:selected { background-color: #3A3A3A; border: 2px solid #0A84FF; color: #FFFFFF; }
-QListWidget#WallpaperGrid::item:hover { background-color: #373737; border: 1px solid #4A4A4A; }
-QScrollBar:vertical { border: none; background: transparent; width: 10px; margin: 0px; }
-QScrollBar::handle:vertical { background: rgba(60, 150, 245, 0.75); min-height: 180px; border-radius: 5px; margin: 2px; }
-QScrollBar::handle:vertical:hover { background: rgba(255, 255, 255, 0.2); }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; background: none; }
-QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical { background: none; }
+
+QSlider::groove:horizontal { border: none; height: 4px; background: #444; border-radius: 2px; }
+QSlider::handle:horizontal { background: #fff; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }
+QSlider::sub-page:horizontal { background: #0A84FF; border-radius: 2px; }
+
+QScrollBar:vertical { border: none; background: transparent; width: 8px; }
+QScrollBar::handle:vertical { background: rgba(255,255,255,0.15); min-height: 40px; border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.25); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
-QLabel#PreviewBox { background-color: #1E1E1E; border: 1px solid #3A3A3A; border-radius: 16px; color: #666666; }
+
+/* ── Workshop ──────────────────────────────────────── */
+QPushButton#TagBtn {
+    background: #333; border: none; border-radius: 12px;
+    padding: 4px 10px; font-size: 11px; color: #ccc; min-height: 16px;
+}
+QPushButton#TagBtn:hover { background: #444; }
+QPushButton#TagBtnActive {
+    background: #0A84FF; border: none; border-radius: 12px;
+    padding: 4px 10px; font-size: 11px; color: #fff; min-height: 16px;
+}
+QPushButton#TagBtnActive:hover { background: #0070E0; }
+QWidget#WorkshopCard { background-color: #222; border: 1px solid #333; border-radius: 8px; }
+QPushButton#DlBtn {
+    background: #0A84FF; border: none; border-radius: 3px;
+    padding: 3px 10px; font-size: 11px; color: white; min-height: 14px;
+}
+QPushButton#DlBtn:hover { background: #0070E0; }
+
+/* ── Status Bar ────────────────────────────────────── */
+QStatusBar { background: #1a1a1a; color: #666; font-size: 11px; border-top: 1px solid #2a2a2a; }
 """
+
+
+# ── Helper Classes ──────────────────────────────────────────────────────────
 
 class Worker(QObject):
     finished = pyqtSignal(object)
@@ -72,7 +179,10 @@ class Worker(QObject):
         self.args = args
         self.kwargs = kwargs
     def run(self):
-        result = self.func(*self.args, **self.kwargs)
+        try:
+            result = self.func(*self.args, **self.kwargs)
+        except Exception as e:
+            result = e
         self.finished.emit(result)
 
 class I18n:
@@ -80,7 +190,7 @@ class I18n:
         self.locale_data = {}
         self.current_code = "en"
         self.available_languages = {
-            "en": "English", "ru": "Русский", "de": "Deutsch",
+            "en": "English", "zh-TW": "繁體中文", "ru": "Русский", "de": "Deutsch",
             "uk": "Українська", "es": "Español", "fr": "Français"
         }
     def load(self, code):
@@ -94,6 +204,7 @@ class I18n:
         text = self.locale_data.get(key, key)
         if kwargs: return text.format(**kwargs)
         return text
+
 
 class WallpaperDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
@@ -115,7 +226,6 @@ class WallpaperDelegate(QStyledItemDelegate):
                 else:
                     self.current_scales[index_ptr] = max(curr - step, target)
                 changed = True
-
         if changed and self.parent():
             self.parent().viewport().update()
 
@@ -123,46 +233,29 @@ class WallpaperDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-
-
         idx_id = index.row()
-
-
         is_hovered = option.state & QStyle.StateFlag.State_MouseOver
-        self.scales[idx_id] = 1.15 if is_hovered else 1.0
-
-
+        self.scales[idx_id] = 1.08 if is_hovered else 1.0
         scale = self.current_scales.get(idx_id, 1.0)
-
         if scale > 1.0:
             painter.translate(option.rect.center())
             painter.scale(scale, scale)
             painter.translate(-option.rect.center())
-
-
-            if is_hovered:
-                shadow_color = QColor(0, 0, 0, 0)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(shadow_color)
-                painter.drawRoundedRect(option.rect.adjusted(2, 2, 2, 2), 5, 5)
-
         super().paint(painter, option, index)
         painter.restore()
+
 
 class WallpaperChangeHandler(FileSystemEventHandler):
     def __init__(self, signal):
         self.signal = signal
-
     def on_any_event(self, event):
         if event.is_directory:
             return
-        # Trigger update on file changes (creation, deletion, modification)
         self.signal.emit()
 
+
 class LibraryWatcher(QObject):
-    # Signal to notify the app that the library needs refreshing (debounced)
     library_changed = pyqtSignal()
-    # Internal signal from worker thread
     _raw_change = pyqtSignal()
 
     def __init__(self):
@@ -170,39 +263,30 @@ class LibraryWatcher(QObject):
         self.observer = Observer()
         self.handler = WallpaperChangeHandler(self._raw_change)
         self.watched_paths = set()
-
-        # Debounce timer
         self.timer = QTimer()
         self.timer.setSingleShot(True)
-        self.timer.setInterval(2000)  # Wait 2 seconds after last event
+        self.timer.setInterval(2000)
         self.timer.timeout.connect(self.library_changed.emit)
-
         self._raw_change.connect(self.on_raw_change)
 
     def on_raw_change(self):
-        # Restart timer to debounce
         self.timer.start()
 
     def update_watches(self, directories):
-        # efficiently update watches
         new_paths = set(directories)
         if new_paths == self.watched_paths:
             return
-
         if self.observer.is_alive():
             self.observer.stop()
             self.observer.join()
-
         self.observer = Observer()
         self.watched_paths = new_paths
-
         for d in directories:
             if os.path.isdir(d):
                 try:
                     self.observer.schedule(self.handler, d, recursive=True)
                 except Exception as e:
                     print(f"Failed to watch {d}: {e}")
-
         try:
             self.observer.start()
         except Exception as e:
@@ -215,16 +299,16 @@ class LibraryWatcher(QObject):
 
 
 class ClickableSlider(QSlider):
-
     def mousePressEvent(self, signal):
-
         if signal.button() == Qt.MouseButton.LeftButton:
             offset = 5
             value = QStyle.sliderValueFromPosition(self.minimum() - offset, self.maximum() + offset,
                                                    signal.pos().x(), self.width())
             self.setValue(value)
-
         super().mousePressEvent(signal)
+
+
+# ── Main Application ────────────────────────────────────────────────────────
 
 class WallpaperApp(QMainWindow):
     def __init__(self):
@@ -235,25 +319,40 @@ class WallpaperApp(QMainWindow):
         self.load_config_data()
         self.i18n.load(self.config.get("current_language", "en"))
         self._ = self.i18n.get
-        self.setWindowTitle(f"{self._('app_title')} [build: props-ui-1]")
-        self.setFixedSize(900, 900)
+
+        # Workshop state
+        self.steam_cmd = SteamCmdService()
+        self.workshop_items: list[WorkshopItem] = []
+        self.workshop_page_num = 1
+        self.workshop_search_text = ""
+        self.workshop_sort_order = SortOrder.TRENDING
+        self.workshop_selected_tags: list[str] = ["Everyone"]
+        self.workshop_api_key = self.config.get("steam_api_key", "")
+        self._workshop_image_cache: dict[str, QPixmap] = {}
+        self._img_threads: list = []
+
+        self.setWindowTitle("Open Wallpaper Engine")
+        self.setMinimumSize(1100, 700)
+        self.resize(1200, 800)
+
         self.setup_ui()
-        self.apply_theme()
-        self.apply_config_ui()
+        self.setStyleSheet(STYLESHEET)
+
         self.setup_tray()
         self.start_scan()
-        self.stack.setCurrentIndex(1)
-        self.nav_bar.setCurrentRow(1)
+
         self.screens = self.detect_screens()
         for s in self.screens:
             self.screen_combo.addItem(s["name"], s)
         self.update_texts()
 
-        # Setup file watcher for auto-refresh
         self.watcher = LibraryWatcher()
         self.watcher.library_changed.connect(self.on_library_changed_auto)
 
         QTimer.singleShot(500, self.restore_last_wallpaper)
+
+        self.steam_cmd.login_state_changed.connect(self._on_steam_login_changed)
+        self.steam_cmd.download_updated.connect(self._on_download_updated)
 
         self.wallpaper_proc_manager = WallpaperProcessManager()
         self.wallpaper_watchdog = QTimer()
@@ -261,343 +360,1145 @@ class WallpaperApp(QMainWindow):
         self.wallpaper_watchdog.timeout.connect(self.check_wallpaper_process)
         self.wallpaper_watchdog.start()
 
-    def on_library_changed_auto(self):
-        # Trigger a scan if one isn't already running
-        if self.btn_scan.isEnabled():
-            self.start_scan()
+        # Default to Installed tab
+        self._switch_tab(0)
+
+    # ── UI Setup ────────────────────────────────────────────────────────
 
     def setup_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout(main_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        root = QVBoxLayout(main_widget)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self.nav_container = QFrame()
-        self.nav_container.setObjectName("NavContainer")
-        self.nav_container.setFixedHeight(50)
-        nav_layout = QHBoxLayout(self.nav_container)
-        nav_layout.setContentsMargins(245, 0, 0, 0)
-        nav_layout.setSpacing(0)
+        # Top bar: tabs + buttons
+        self._build_top_bar(root)
 
-        self.nav_bar = QListWidget()
-        self.nav_bar.setObjectName("Sidebar")
-        self.nav_bar.setFlow(QListWidget.Flow.LeftToRight)
-        self.nav_bar.setFixedWidth(600)
-        self.nav_bar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.nav_bar.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.nav_bar.addItems(["Control", "Library"])
-        for i in range(self.nav_bar.count()):
-            item = self.nav_bar.item(i)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item.setSizeHint(QSize(200, 32))
+        # Main content: splitter with left panel + right preview
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(self.main_splitter, 1)
 
-        self.nav_bar.currentRowChanged.connect(self.switch_page)
+        # Left panel: stacked (Installed | Workshop | Settings)
+        left_panel = QWidget()
+        left_panel.setObjectName("LeftPanel")
+        self.left_layout = QVBoxLayout(left_panel)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.setSpacing(0)
 
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.nav_bar)
-        nav_layout.addStretch()
-        nav_layout.addSpacing(250)
+        self.content_stack = QStackedWidget()
+        self.left_layout.addWidget(self.content_stack)
 
-        main_layout.addWidget(self.nav_container)
+        # Page 0: Installed (explorer bar + grid)
+        self.page_installed = QWidget()
+        self._build_installed_page()
+        self.content_stack.addWidget(self.page_installed)
 
-        self.stack = QStackedWidget()
-        main_layout.addWidget(self.stack)
-        self.page_control = QWidget()
-        self.setup_control_page()
-        self.stack.addWidget(self.page_control)
-        self.page_library = QWidget()
-        self.setup_library_page()
-        self.stack.addWidget(self.page_library)
+        # Page 1: Workshop
+        self.page_workshop = QWidget()
+        self._build_workshop_page()
+        self.content_stack.addWidget(self.page_workshop)
+
+        # Page 2: Settings
+        self.page_settings = QWidget()
+        self._build_settings_page()
+        self.content_stack.addWidget(self.page_settings)
+
+        self.main_splitter.addWidget(left_panel)
+
+        # Right panel: Preview
+        self.preview_panel = QWidget()
+        self.preview_panel.setObjectName("PreviewPanel")
+        self.preview_panel.setMinimumWidth(280)
+        self.preview_panel.setMaximumWidth(360)
+        self._build_preview_panel()
+        self.main_splitter.addWidget(self.preview_panel)
+
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes([850, 320])
+
         self.status_bar = self.statusBar()
-        self.status_bar.showMessage("Ready")
-        self.status_bar.hide()
+        self.status_bar.showMessage(self._("ready"))
 
-    def setup_control_page(self):
-        layout = QVBoxLayout(self.page_control)
-        layout.setContentsMargins(32, 32, 32, 32)
-        layout.setSpacing(20)
-        card_main = self.create_card(layout, "main_controls_frame")
-        self.wp_id_input = QLineEdit()
-        self.wp_id_input.textChanged.connect(self.on_wallpaper_id_changed)
-        self.screen_combo = QComboBox()
-        self.screen_combo.setEditable(True)
-        self.add_form_row(card_main, "wallpaper_id_path_label", self.wp_id_input)
-        self.add_form_row(card_main, "screen_label", self.screen_combo)
-        h_layout = QHBoxLayout()
-        h_layout.setSpacing(20)
-        layout.addLayout(h_layout)
-        card_audio = self.create_card(h_layout, "audio_frame")
-        self.chk_silent = QCheckBox("silent_checkbox")
-        self.chk_silent.clicked.connect(self.run_wallpaper)
-        self.slider_volume = ClickableSlider(Qt.Orientation.Horizontal)
-        self.slider_volume.setRange(0, 100)
-        self.slider_volume.setValue(15)
-        self.slider_volume.sliderReleased.connect(self.run_wallpaper)
-        self.chk_no_automute = QCheckBox("no_automute_checkbox")
-        self.chk_no_automute.clicked.connect(self.run_wallpaper)
-        self.chk_no_proc = QCheckBox("no_audio_processing_checkbox")
-        self.chk_no_proc.clicked.connect(self.run_wallpaper)
-        l = card_audio.layout()
-        l.addWidget(self.chk_silent)
-        l.addWidget(self.create_label("volume_label"))
-        l.addWidget(self.slider_volume)
-        l.addWidget(self.chk_no_automute)
-        l.addWidget(self.chk_no_proc)
-        card_perf = self.create_card(h_layout, "perf_frame")
-        self.slider_fps = ClickableSlider(Qt.Orientation.Horizontal)
-        self.slider_fps.setRange(10, 144)
-        self.slider_fps.setValue(30)
-        self.slider_fps.sliderReleased.connect(self.run_wallpaper)
-        self.chk_mouse = QCheckBox("disable_mouse_checkbox")
-        self.chk_mouse.clicked.connect(self.run_wallpaper)
-        self.chk_parallax = QCheckBox("disable_parallax_checkbox")
-        self.chk_parallax.clicked.connect(self.run_wallpaper)
-        self.chk_fs_pause = QCheckBox("no_fullscreen_pause_checkbox")
-        self.chk_fs_pause.clicked.connect(self.run_wallpaper)
-        l = card_perf.layout()
-        l.addWidget(self.create_label("fps_label"))
-        l.addWidget(self.slider_fps)
-        l.addWidget(self.chk_mouse)
-        l.addWidget(self.chk_parallax)
-        l.addWidget(self.chk_fs_pause)
-        card_adv = self.create_card(layout, "adv_frame")
-        self.combo_scaling = QComboBox()
-        self.combo_scaling.addItems(['default', 'stretch', 'fit', 'fill'])
-        if "scale" in self.config:
-            self.combo_scaling.setCurrentText(self.config["scale"])
-        self.combo_scaling.currentTextChanged.connect(self.run_wallpaper)
-        self.combo_clamp = QComboBox()
-        self.combo_clamp.addItems(['clamp', 'border', 'repeat'])
-        if "clamp" in self.config:
-            self.combo_clamp.setCurrentText(self.config["clamp"])
-        self.combo_clamp.currentTextChanged.connect(self.run_wallpaper)
-        self.chk_windowed_mode = QCheckBox("windowed_mode_checkbox")
-        self.chk_windowed_mode.clicked.connect(self.run_wallpaper)
-        self.input_custom_args = QLineEdit()
-        self.input_custom_args.setPlaceholderText("--window 0x0x1280x720")
+    def _build_top_bar(self, parent):
+        bar = QWidget()
+        bar.setObjectName("TopBar")
+        bar.setFixedHeight(44)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(12, 0, 12, 0)
+        h.setSpacing(0)
 
-        self.combo_lang = QComboBox()
-        self.combo_lang.currentTextChanged.connect(self.change_lang)
+        # Tab buttons
+        self.tab_installed = QPushButton(self._("tab_installed"))
+        self.tab_installed.setObjectName("TabBtnActive")
+        self.tab_installed.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tab_installed.clicked.connect(lambda: self._switch_tab(0))
 
-        self.add_form_row(card_adv, "language_label", self.combo_lang)
-        self.add_form_row(card_adv, "scaling_label", self.combo_scaling)
-        self.add_form_row(card_adv, "clamp_label", self.combo_clamp)
-        card_adv.layout().addWidget(self.chk_windowed_mode)
+        self.tab_workshop = QPushButton(self._("tab_workshop"))
+        self.tab_workshop.setObjectName("TabBtn")
+        self.tab_workshop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tab_workshop.clicked.connect(lambda: self._switch_tab(1))
 
-        self.lbl_kwin_hint = QLabel("kwin_hint")
-        self.lbl_kwin_hint.setWordWrap(True)
-        self.lbl_kwin_hint.setStyleSheet("color: #888; font-size: 11px; margin-left: 24px; margin-bottom: 8px;")
-        self.lbl_kwin_hint.setVisible(False)
-        self.chk_windowed_mode.toggled.connect(self.lbl_kwin_hint.setVisible)
-        card_adv.layout().addWidget(self.lbl_kwin_hint)
+        h.addWidget(self.tab_installed)
+        h.addWidget(self.tab_workshop)
+        h.addStretch()
 
-        props_controls = QHBoxLayout()
-        props_controls.setSpacing(10)
-        props_controls.setContentsMargins(0, 0, 0, 0)
-        self.properties_type = QLabel()
-        self.properties_type.setMinimumWidth(120)
-        self.properties_type.setStyleSheet("color: #A5A5A5;")
-        self.properties_combo = QComboBox()
-        self.properties_combo.setEditable(False)
-        self.properties_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.properties_combo.setMinimumWidth(280)
-        self.properties_combo.addItem(self._("properties_select_placeholder"), None)
-        self.properties_combo.currentIndexChanged.connect(self.on_property_selected)
-        self.properties_value = QLineEdit()
-        self.properties_value.setPlaceholderText(self._("property_value_placeholder"))
-        self.properties_value.editingFinished.connect(self.apply_property_value)
-        self.properties_value.setMinimumWidth(240)
-        self.properties_value.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn_load_props = QPushButton("load_properties_button")
-        self.btn_load_props.clicked.connect(self.load_properties)
-        self.btn_apply_prop = QPushButton("apply_property_button")
-        self.btn_apply_prop.clicked.connect(self.apply_property_value)
-        for btn in (self.btn_load_props, self.btn_apply_prop):
-            btn.setMinimumWidth(120)
-            btn.setMinimumHeight(32)
-            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        # Right-side bar buttons
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.VLine)
+        sep1.setFixedHeight(24)
+        sep1.setStyleSheet("color: #333;")
+        h.addWidget(sep1)
 
-        props_header = QHBoxLayout()
-        props_label = self.create_label("set_property_label")
-        props_header.addWidget(props_label)
-        props_header.addStretch()
-        props_header.addWidget(self.btn_load_props)
-        props_header.addWidget(self.btn_apply_prop)
-        card_adv.layout().addLayout(props_header)
+        btn_settings = QPushButton(self._("tab_settings"))
+        btn_settings.setObjectName("BarButton")
+        btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_settings.clicked.connect(lambda: self._switch_tab(2))
+        h.addWidget(btn_settings)
 
-        props_controls.addWidget(self.properties_combo)
-        props_controls.addWidget(self.properties_type)
-        props_controls.addWidget(self.properties_value, 1)
-        card_adv.layout().addLayout(props_controls)
-        self.add_form_row(card_adv, "Custom Arguments", self.input_custom_args)
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
-        layout.addLayout(btn_layout)
-        self.btn_set = QPushButton("set_wallpaper_button")
-        self.btn_set.clicked.connect(self.run_wallpaper)
-        self.btn_set.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_set.setMinimumHeight(32)
-        self.btn_show_log = QPushButton("show_log_button")
-        self.btn_show_log.setObjectName("SecondaryButton")
-        self.btn_show_log.clicked.connect(self.show_log_file)
-        self.btn_show_log.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_show_log.setMinimumHeight(32)
-        self.btn_stop = QPushButton("stop_button")
-        self.btn_stop.setObjectName("DangerButton")
-        self.btn_stop.clicked.connect(self.stop_wallpapers)
-        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_stop.setMinimumHeight(32)
-        btn_layout.addWidget(self.btn_set)
-        btn_layout.addWidget(self.btn_show_log)
-        btn_layout.addWidget(self.btn_stop)
-        layout.addStretch()
+        parent.addWidget(bar)
 
-    def setup_library_page(self):
-        layout = QVBoxLayout(self.page_library)
-        layout.setContentsMargins(12, 24, 0, 0)
-        layout.setSpacing(0)
-        push_buttons_layout = QHBoxLayout()
-        push_buttons_layout.setContentsMargins(165, 0, 0, 0)
-        push_buttons_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        header = QHBoxLayout()
-        self.btn_scan = QPushButton("scan_local_wallpapers_button")
-        self.btn_scan.clicked.connect(self.start_scan)
-        self.btn_scan.setFixedSize(160, 200)
-        self.btn_scan.setCursor(Qt.CursorShape.PointingHandCursor)
-        push_buttons_layout.addWidget(self.btn_scan)
-        push_buttons_layout.addSpacing(25)
-        self.btn_set_library = QPushButton("set_wallpaper_button")
-        self.btn_set_library.clicked.connect(self.run_wallpaper)
-        self.btn_set_library.setFixedSize(160, 200)
-        self.btn_set_library.setObjectName("PrimaryButton")
-        self.btn_set_library.setCursor(Qt.CursorShape.PointingHandCursor)
-        push_buttons_layout.addWidget(self.btn_set_library)
-        self.btn_select_folder = QPushButton("select_folder_button")
-        self.btn_select_folder.clicked.connect(self.manual_scan)
-        self.btn_select_folder.setFixedSize(160, 200)
-        self.btn_select_folder.setCursor(Qt.CursorShape.PointingHandCursor)
-        push_buttons_layout.addSpacing(25)
-        push_buttons_layout.addWidget(self.btn_select_folder)
-        layout.addLayout(push_buttons_layout)
-        layout.addLayout(header)
-        
+    def _switch_tab(self, index):
+        self.content_stack.setCurrentIndex(index)
+        # Update tab button styles
+        self.tab_installed.setObjectName("TabBtnActive" if index == 0 else "TabBtn")
+        self.tab_workshop.setObjectName("TabBtnActive" if index == 1 else "TabBtn")
+        # Force style refresh
+        self.tab_installed.setStyleSheet("")
+        self.tab_workshop.setStyleSheet("")
+        # Show/hide preview panel
+        self.preview_panel.setVisible(index == 0)
+
+    # ── Installed Page ──────────────────────────────────────────────────
+
+    def _build_installed_page(self):
+        v = QVBoxLayout(self.page_installed)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # Explorer top bar: search + sort + actions
+        ebar = QWidget()
+        ebar.setObjectName("ExplorerBar")
+        ebar.setFixedHeight(44)
+        eh = QHBoxLayout(ebar)
+        eh.setContentsMargins(12, 6, 12, 6)
+        eh.setSpacing(8)
+
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText(self._("search_placeholder"))
+        self.search_input.setObjectName("SearchField")
+        self.search_input.setPlaceholderText(self._("search_dots"))
+        self.search_input.setFixedWidth(200)
         self.search_input.textChanged.connect(self.filter_wallpapers)
-        self.search_input.setFixedWidth(350)
+        eh.addWidget(self.search_input)
+
+        self.btn_scan = QPushButton(self._("scan_library"))
+        self.btn_scan.setObjectName("PrimaryBtn")
+        self.btn_scan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_scan.clicked.connect(self.start_scan)
+        eh.addWidget(self.btn_scan)
+
+        self.btn_select_folder = QPushButton(self._("open_folder"))
+        self.btn_select_folder.setObjectName("SecBtn")
+        self.btn_select_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_select_folder.clicked.connect(self.manual_scan)
+        eh.addWidget(self.btn_select_folder)
+
+        eh.addStretch()
+
+        self.btn_reverse_sorted = QPushButton("↑")
+        self.btn_reverse_sorted.setObjectName("BarButton")
+        self.btn_reverse_sorted.setFixedSize(32, 32)
+        self.btn_reverse_sorted.clicked.connect(self.reverse_sorted)
+        eh.addWidget(self.btn_reverse_sorted)
+
         self.sorting_type = QComboBox()
-        self.sorting_type.addItems(["Name", "Subscription Date"])
+        self.sorting_type.addItems([self._("sort_name"), self._("sort_subscription_date")])
         self.sorting_type.setFixedWidth(150)
-        self.sorting_type.setStyleSheet("text-align: left;")
         self.sort_reversed_state = False
         self.sorting_type.currentTextChanged.connect(self.on_sort_change)
-        self.btn_reverse_sorted = QPushButton("↑")
-        self.btn_reverse_sorted.setFixedSize(50, 50)
-        self.btn_reverse_sorted.setStyleSheet("background-color: None; font-size: 22px;")
-        self.btn_reverse_sorted.clicked.connect(self.reverse_sorted)
-        search_layout = QHBoxLayout()
-        search_layout.setSpacing(0)
-        search_layout.setContentsMargins(64,10,0,0)
-        search_layout.addWidget(self.search_input)
-        search_layout.addSpacing(183)
-        search_layout.addWidget(self.btn_reverse_sorted)
-        search_layout.addWidget(self.sorting_type)
-        search_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        layout.addLayout(search_layout)
+        eh.addWidget(self.sorting_type)
 
+        v.addWidget(ebar)
+
+        # Wallpaper grid
         self.list_wallpapers = QListWidget()
-        self.list_wallpapers.setMovement(QListWidget.Movement.Static)
         self.list_wallpapers.setObjectName("WallpaperGrid")
+        self.list_wallpapers.setMovement(QListWidget.Movement.Static)
         self.list_wallpapers.setViewMode(QListWidget.ViewMode.IconMode)
         self.list_wallpapers.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.list_wallpapers.setGridSize(QSize(190, 250))
-        self.list_wallpapers.setSpacing(100)
+        self.list_wallpapers.setGridSize(QSize(180, 210))
+        self.list_wallpapers.setSpacing(8)
         self.list_wallpapers.setWordWrap(True)
-        self.list_wallpapers.setIconSize(QSize(150, 170))
+        self.list_wallpapers.setIconSize(QSize(160, 160))
         self.list_wallpapers.setItemDelegate(WallpaperDelegate(self.list_wallpapers))
         self.list_wallpapers.setMouseTracking(True)
         self.list_wallpapers.itemClicked.connect(self.on_wallpaper_selected)
         self.list_wallpapers.itemDoubleClicked.connect(self.run_wallpaper)
         self.list_wallpapers.setItemAlignment(Qt.AlignmentFlag.AlignCenter)
-        wallpapers_layout = QVBoxLayout()
-        wallpapers_layout.addWidget(self.list_wallpapers)
-        wallpapers_layout.setContentsMargins(50,0,0,0)
-        layout.addLayout(wallpapers_layout)
+        v.addWidget(self.list_wallpapers, 1)
 
-    def create_label(self, text_key):
-        lbl = QLabel(self._(text_key))
-        self.translatable_labels.append((lbl, text_key))
-        return lbl
+        # Bottom bar: Open Wallpaper button
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(12, 6, 12, 6)
+        self.btn_set_library = QPushButton(self._("set_wallpaper"))
+        self.btn_set_library.setObjectName("PrimaryBtn")
+        self.btn_set_library.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_set_library.clicked.connect(self.run_wallpaper)
+        bottom.addWidget(self.btn_set_library)
+        bottom.addStretch()
+        v.addLayout(bottom)
 
-    def create_card(self, parent_layout, title_key):
-        frame = QFrame()
-        frame.setProperty("class", "Card")
-        vbox = QVBoxLayout(frame)
-        vbox.setContentsMargins(20, 20, 20, 20)
-        vbox.setSpacing(12)
-        lbl = self.create_label(title_key)
-        lbl.setProperty("class", "CardTitle")
-        vbox.addWidget(lbl)
-        parent_layout.addWidget(frame)
-        return frame
+    # ── Preview Panel (right side) ──────────────────────────────────────
 
-    def add_form_row(self, card, label_key, widget):
-        h = QHBoxLayout()
-        l = self.create_label(label_key)
-        h.addWidget(l)
-        h.addWidget(widget)
-        card.layout().addLayout(h)
+    def _build_preview_panel(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
 
-    def apply_theme(self):
-        self.setStyleSheet(MACOS_DARK)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(12)
+        v.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-    def update_texts(self):
-        items = ["control_tab", "local_library_tab"]
-        for i, key in enumerate(items):
-            self.nav_bar.item(i).setText(self._(key))
+        # Preview image
+        self.preview_image = QLabel()
+        self.preview_image.setObjectName("PreviewImage")
+        self.preview_image.setFixedSize(260, 260)
+        self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image.setStyleSheet(
+            "background-color: #111; border: 3px solid #fff; border-radius: 12px; color: #666;"
+        )
+        self.preview_image.setText(self._("no_wallpaper_selected"))
+        v.addWidget(self.preview_image, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        for widget, key in self.translatable_labels:
-            widget.setText(self._(key))
+        # Title
+        self.preview_title = QLabel(self._("select_a_wallpaper"))
+        self.preview_title.setObjectName("PreviewTitle")
+        self.preview_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_title.setWordWrap(True)
+        v.addWidget(self.preview_title)
 
-        self.combo_lang.blockSignals(True)
-        self.combo_lang.clear()
-        for code, name in self.i18n.available_languages.items():
-            self.combo_lang.addItem(name, code)
-        self.combo_lang.setCurrentText(self.i18n.available_languages.get(self.i18n.current_code, "English"))
-        self.combo_lang.blockSignals(False)
-        self.btn_set.setText(self._("set_wallpaper_button"))
-        self.btn_set_library.setText(self._("set_wallpaper_button"))
-        self.btn_stop.setText(self._("stop_button"))
-        self.btn_show_log.setText(self._("show_log_button"))
-        self.btn_scan.setText(self._("scan_local_wallpapers_button"))
-        self.btn_select_folder.setText(self._("select_folder_button"))
-        self.chk_silent.setText(self._("silent_checkbox"))
-        self.chk_no_automute.setText(self._("no_automute_checkbox"))
-        self.chk_no_proc.setText(self._("no_audio_processing_checkbox"))
-        self.chk_mouse.setText(self._("disable_mouse_checkbox"))
-        self.chk_parallax.setText(self._("disable_parallax_checkbox"))
-        self.chk_fs_pause.setText(self._("no_fullscreen_pause_checkbox"))
-        self.chk_windowed_mode.setText(self._("windowed_mode_checkbox"))
-        self.lbl_kwin_hint.setText(self._("kwin_hint"))
-        self.btn_load_props.setText(self._("load_properties_button"))
-        self.btn_apply_prop.setText(self._("apply_property_button"))
-        self.properties_combo.setItemText(0, self._("properties_select_placeholder"))
-        self.properties_value.setPlaceholderText(self._("property_value_placeholder"))
-        self.search_input.setPlaceholderText(self._("search_placeholder"))
+        # Type + Size
+        self.preview_meta = QLabel("")
+        self.preview_meta.setObjectName("PreviewMeta")
+        self.preview_meta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self.preview_meta)
 
-    def switch_page(self, row):
-        self.stack.setCurrentIndex(row)
+        # Tags row
+        self.preview_tags_layout = QHBoxLayout()
+        self.preview_tags_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_tags_layout.setSpacing(4)
+        v.addLayout(self.preview_tags_layout)
 
-    def change_lang(self, text):
-        code = self.combo_lang.currentData()
-        if self.i18n.load(code):
-            self.update_texts()
-            self.config["current_language"] = code
+        # ── Properties Section ──
+        prop_header = QHBoxLayout()
+        prop_header.setSpacing(4)
+        prop_lbl = QLabel(self._("properties_section"))
+        prop_lbl.setObjectName("SectionDivider")
+        prop_header.addWidget(prop_lbl)
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color: #0A84FF;")
+        prop_header.addWidget(line, 1)
+        v.addLayout(prop_header)
+
+        # Screen selector
+        screen_row = QHBoxLayout()
+        screen_lbl = QLabel(self._("screen"))
+        screen_lbl.setStyleSheet("font-size: 12px; color: #aaa;")
+        screen_row.addWidget(screen_lbl)
+        self.screen_combo = QComboBox()
+        self.screen_combo.setEditable(True)
+        screen_row.addWidget(self.screen_combo, 1)
+        v.addLayout(screen_row)
+
+        # Volume
+        vol_row = QHBoxLayout()
+        vol_lbl = QLabel(self._("volume"))
+        vol_lbl.setStyleSheet("font-size: 12px; color: #aaa;")
+        vol_row.addWidget(vol_lbl)
+        self.chk_silent = QCheckBox(self._("mute"))
+        self.chk_silent.clicked.connect(self.run_wallpaper)
+        vol_row.addWidget(self.chk_silent)
+        self.slider_volume = ClickableSlider(Qt.Orientation.Horizontal)
+        self.slider_volume.setRange(0, 100)
+        self.slider_volume.setValue(15)
+        self.slider_volume.sliderReleased.connect(self.run_wallpaper)
+        vol_row.addWidget(self.slider_volume, 1)
+        v.addLayout(vol_row)
+
+        # FPS
+        fps_row = QHBoxLayout()
+        fps_lbl = QLabel(self._("fps"))
+        fps_lbl.setStyleSheet("font-size: 12px; color: #aaa;")
+        fps_row.addWidget(fps_lbl)
+        self.slider_fps = ClickableSlider(Qt.Orientation.Horizontal)
+        self.slider_fps.setRange(10, 144)
+        self.slider_fps.setValue(30)
+        self.slider_fps.sliderReleased.connect(self.run_wallpaper)
+        fps_row.addWidget(self.slider_fps, 1)
+        self.fps_value_label = QLabel("30")
+        self.fps_value_label.setStyleSheet("font-size: 12px; color: #888; min-width: 24px;")
+        self.slider_fps.valueChanged.connect(lambda val: self.fps_value_label.setText(str(val)))
+        fps_row.addWidget(self.fps_value_label)
+        v.addLayout(fps_row)
+
+        # Scaling
+        scale_row = QHBoxLayout()
+        scale_lbl = QLabel(self._("scaling"))
+        scale_lbl.setStyleSheet("font-size: 12px; color: #aaa;")
+        scale_row.addWidget(scale_lbl)
+        self.combo_scaling = QComboBox()
+        self.combo_scaling.addItems(['default', 'stretch', 'fit', 'fill'])
+        if "scale" in self.config:
+            self.combo_scaling.setCurrentText(self.config["scale"])
+        self.combo_scaling.currentTextChanged.connect(self.run_wallpaper)
+        scale_row.addWidget(self.combo_scaling, 1)
+        v.addLayout(scale_row)
+
+        # Clamp
+        clamp_row = QHBoxLayout()
+        clamp_lbl = QLabel(self._("clamp"))
+        clamp_lbl.setStyleSheet("font-size: 12px; color: #aaa;")
+        clamp_row.addWidget(clamp_lbl)
+        self.combo_clamp = QComboBox()
+        self.combo_clamp.addItems(['clamp', 'border', 'repeat'])
+        if "clamp" in self.config:
+            self.combo_clamp.setCurrentText(self.config["clamp"])
+        self.combo_clamp.currentTextChanged.connect(self.run_wallpaper)
+        clamp_row.addWidget(self.combo_clamp, 1)
+        v.addLayout(clamp_row)
+
+        # Checkboxes
+        self.chk_no_automute = QCheckBox(self._("no_automute"))
+        self.chk_no_automute.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.chk_no_automute)
+        self.chk_no_proc = QCheckBox(self._("no_audio_processing"))
+        self.chk_no_proc.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.chk_no_proc)
+        self.chk_mouse = QCheckBox(self._("disable_mouse"))
+        self.chk_mouse.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.chk_mouse)
+        self.chk_parallax = QCheckBox(self._("disable_parallax"))
+        self.chk_parallax.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.chk_parallax)
+        self.chk_fs_pause = QCheckBox(self._("no_fullscreen_pause"))
+        self.chk_fs_pause.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.chk_fs_pause)
+        self.chk_windowed_mode = QCheckBox(self._("windowed_mode"))
+        self.chk_windowed_mode.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.chk_windowed_mode)
+
+        # Hidden wallpaper ID field
+        self.wp_id_input = QLineEdit()
+        self.wp_id_input.setPlaceholderText(self._("wallpaper_id_placeholder"))
+        self.wp_id_input.textChanged.connect(self.on_wallpaper_id_changed)
+        v.addWidget(self.wp_id_input)
+
+        # Custom args
+        self.input_custom_args = QLineEdit()
+        self.input_custom_args.setPlaceholderText(self._("custom_args_placeholder"))
+        v.addWidget(self.input_custom_args)
+
+        # Properties
+        prop2_header = QHBoxLayout()
+        prop2_header.setSpacing(4)
+        prop2_lbl = QLabel(self._("wallpaper_properties"))
+        prop2_lbl.setObjectName("SectionDivider")
+        prop2_header.addWidget(prop2_lbl)
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.Shape.HLine)
+        line2.setStyleSheet("color: #0A84FF;")
+        prop2_header.addWidget(line2, 1)
+        v.addLayout(prop2_header)
+
+        props_row = QHBoxLayout()
+        self.properties_combo = QComboBox()
+        self.properties_combo.setEditable(False)
+        self.properties_combo.addItem(self._("select_property"), None)
+        self.properties_combo.currentIndexChanged.connect(self.on_property_selected)
+        props_row.addWidget(self.properties_combo, 1)
+        v.addLayout(props_row)
+
+        pval_row = QHBoxLayout()
+        self.properties_type = QLabel()
+        self.properties_type.setStyleSheet("font-size: 11px; color: #888;")
+        pval_row.addWidget(self.properties_type)
+        self.properties_value = QLineEdit()
+        self.properties_value.setPlaceholderText(self._("value"))
+        self.properties_value.editingFinished.connect(self.apply_property_value)
+        pval_row.addWidget(self.properties_value, 1)
+        v.addLayout(pval_row)
+
+        props_btn_row = QHBoxLayout()
+        self.btn_load_props = QPushButton(self._("load_props"))
+        self.btn_load_props.setObjectName("SecBtn")
+        self.btn_load_props.clicked.connect(self.load_properties)
+        props_btn_row.addWidget(self.btn_load_props)
+        self.btn_apply_prop = QPushButton(self._("apply"))
+        self.btn_apply_prop.setObjectName("PrimaryBtn")
+        self.btn_apply_prop.clicked.connect(self.apply_property_value)
+        props_btn_row.addWidget(self.btn_apply_prop)
+        v.addLayout(props_btn_row)
+
+        # Action buttons
+        v.addSpacing(8)
+        act_header = QHBoxLayout()
+        act_lbl = QLabel(self._("actions"))
+        act_lbl.setObjectName("SectionDivider")
+        act_header.addWidget(act_lbl)
+        line3 = QFrame()
+        line3.setFrameShape(QFrame.Shape.HLine)
+        line3.setStyleSheet("color: #0A84FF;")
+        act_header.addWidget(line3, 1)
+        v.addLayout(act_header)
+
+        self.btn_set = QPushButton(self._("set_wallpaper"))
+        self.btn_set.setObjectName("PrimaryBtn")
+        self.btn_set.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_set.clicked.connect(self.run_wallpaper)
+        v.addWidget(self.btn_set)
+
+        self.btn_show_log = QPushButton(self._("show_log"))
+        self.btn_show_log.setObjectName("SecBtn")
+        self.btn_show_log.clicked.connect(self.show_log_file)
+        v.addWidget(self.btn_show_log)
+
+        self.btn_stop = QPushButton(self._("stop_all"))
+        self.btn_stop.setObjectName("DangerBtn")
+        self.btn_stop.clicked.connect(self.stop_wallpapers)
+        v.addWidget(self.btn_stop)
+
+        v.addStretch()
+
+        scroll.setWidget(inner)
+        layout = QVBoxLayout(self.preview_panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+    # ── Settings Page ───────────────────────────────────────────────────
+
+    def _build_settings_page(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(32, 32, 32, 32)
+        v.setSpacing(16)
+        v.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        title = QLabel(self._("tab_settings"))
+        title.setStyleSheet("font-size: 22px; font-weight: 700; color: #fff;")
+        v.addWidget(title)
+
+        # Language
+        lang_row = QHBoxLayout()
+        lang_lbl = QLabel(self._("language"))
+        lang_lbl.setStyleSheet("font-size: 13px; color: #aaa;")
+        lang_row.addWidget(lang_lbl)
+        self.combo_lang = QComboBox()
+        self.combo_lang.currentTextChanged.connect(self.change_lang)
+        lang_row.addWidget(self.combo_lang, 1)
+        v.addLayout(lang_row)
+
+        v.addStretch()
+        scroll.setWidget(inner)
+
+        layout = QVBoxLayout(self.page_settings)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+    # ── Workshop Page ───────────────────────────────────────────────────
+
+    def _build_workshop_page(self):
+        v = QVBoxLayout(self.page_workshop)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        self.workshop_stack = QStackedWidget()
+        v.addWidget(self.workshop_stack)
+
+        self._build_steamcmd_missing_view()
+        self._build_steam_login_view()
+        self._build_workshop_browser_view()
+        self._update_workshop_view_state()
+
+    def _build_steamcmd_missing_view(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.setSpacing(16)
+
+        icon = QLabel("!")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet("font-size: 40px; color: #666;")
+        v.addWidget(icon)
+
+        title = QLabel(self._("steamcmd_not_found_title"))
+        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #fff;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title)
+
+        desc = QLabel(self._("steamcmd_desc"))
+        desc.setStyleSheet("font-size: 13px; color: #888;")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+
+        cmd_row = QHBoxLayout()
+        cmd_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cmd = QLabel("yay -S steamcmd")
+        cmd.setStyleSheet("font-family: monospace; font-size: 13px; background: #222; padding: 8px 14px; border-radius: 6px; color: #fff; border: 1px solid #333;")
+        cmd_row.addWidget(cmd)
+        self.btn_copy_cmd = QPushButton(self._("copy"))
+        self.btn_copy_cmd.setObjectName("SecBtn")
+        self.btn_copy_cmd.setFixedWidth(60)
+        self.btn_copy_cmd.clicked.connect(lambda: (
+            QApplication.clipboard().setText("yay -S steamcmd"),
+            self.btn_copy_cmd.setText(self._("copied")),
+            QTimer.singleShot(2000, lambda: self.btn_copy_cmd.setText(self._("copy")))
+        ))
+        cmd_row.addWidget(self.btn_copy_cmd)
+        v.addLayout(cmd_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #333;")
+        sep.setFixedWidth(200)
+        sh = QHBoxLayout()
+        sh.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sh.addWidget(sep)
+        v.addLayout(sh)
+
+        or_lbl = QLabel(self._("locate_steamcmd"))
+        or_lbl.setStyleSheet("font-size: 13px; color: #888;")
+        or_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(or_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        btn_browse = QPushButton(self._("browse_dots"))
+        btn_browse.setObjectName("SecBtn")
+        btn_browse.clicked.connect(self._browse_steamcmd)
+        btn_row.addWidget(btn_browse)
+        btn_re = QPushButton(self._("redetect"))
+        btn_re.setObjectName("LinkBtn")
+        btn_re.clicked.connect(self._redetect_steamcmd)
+        btn_row.addWidget(btn_re)
+        v.addLayout(btn_row)
+
+        self.workshop_stack.addWidget(page)
+
+    def _build_steam_login_view(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.setSpacing(16)
+
+        title = QLabel(self._("steam_login_title"))
+        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #fff;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title)
+
+        desc = QLabel(self._("steam_login_desc"))
+        desc.setStyleSheet("font-size: 13px; color: #888;")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+
+        self.steam_username_input = QLineEdit()
+        self.steam_username_input.setPlaceholderText(self._("steam_username"))
+        self.steam_username_input.setFixedWidth(280)
+        v.addWidget(self.steam_username_input, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.steam_password_input = QLineEdit()
+        self.steam_password_input.setPlaceholderText(self._("password"))
+        self.steam_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.steam_password_input.setFixedWidth(280)
+        v.addWidget(self.steam_password_input, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.steam_guard_input = QLineEdit()
+        self.steam_guard_input.setPlaceholderText(self._("steam_guard_code"))
+        self.steam_guard_input.setFixedWidth(280)
+        self.steam_guard_input.hide()
+        v.addWidget(self.steam_guard_input, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.steam_login_error = QLabel("")
+        self.steam_login_error.setStyleSheet("font-size: 12px; color: #FF453A;")
+        self.steam_login_error.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.steam_login_error.setWordWrap(True)
+        self.steam_login_error.hide()
+        v.addWidget(self.steam_login_error, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        btn_row = QHBoxLayout()
+        btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        btn_row.setSpacing(12)
+        self.btn_steam_login = QPushButton(self._("log_in"))
+        self.btn_steam_login.setObjectName("PrimaryBtn")
+        self.btn_steam_login.clicked.connect(self._steam_login)
+        btn_row.addWidget(self.btn_steam_login)
+        self.btn_steam_cached = QPushButton(self._("use_cached_session"))
+        self.btn_steam_cached.setObjectName("SecBtn")
+        self.btn_steam_cached.clicked.connect(self._steam_login_cached)
+        btn_row.addWidget(self.btn_steam_cached)
+        v.addLayout(btn_row)
+
+        self.steam_login_progress = QLabel(self._("authenticating_steam"))
+        self.steam_login_progress.setStyleSheet("font-size: 12px; color: #888;")
+        self.steam_login_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.steam_login_progress.hide()
+        v.addWidget(self.steam_login_progress, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # API key
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #333;")
+        sep.setFixedWidth(300)
+        sh = QHBoxLayout()
+        sh.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sh.addWidget(sep)
+        v.addLayout(sh)
+
+        api_desc = QLabel(self._("api_key_desc"))
+        api_desc.setStyleSheet("font-size: 12px; color: #888;")
+        api_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(api_desc)
+
+        self._add_api_key_row(v, is_login=True)
+
+        self.workshop_stack.addWidget(page)
+
+    def _add_api_key_row(self, parent, is_login=False):
+        row = QHBoxLayout()
+        row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inp = QLineEdit()
+        inp.setPlaceholderText(self._("steam_api_key"))
+        inp.setFixedWidth(300)
+        inp.setText(self.workshop_api_key)
+        # Keep strong reference to prevent GC/deletion crashes
+        if not hasattr(self, '_api_key_inputs'):
+            self._api_key_inputs = []
+        self._api_key_inputs.append(inp)
+        if is_login:
+            self._login_api_input = inp
+        row.addWidget(inp)
+        btn_text = self._("save_button") if is_login else self._("save_and_search_button")
+        btn = QPushButton(btn_text)
+        btn.setObjectName("PrimaryBtn")
+        btn.setFixedWidth(100 if not is_login else 60)
+        # Capture inp by reference safely
+        def _on_save(_, ref=inp):
+            try:
+                text = ref.text()
+            except RuntimeError:
+                text = self.workshop_api_key
+            self._save_api_key_from(text)
+        btn.clicked.connect(_on_save)
+        row.addWidget(btn)
+        parent.addLayout(row)
+
+        link = QLabel(f'<a href="https://steamcommunity.com/dev/apikey" style="color: #0A84FF; font-size: 11px;">{self._("api_key_link")}</a>')
+        link.setOpenExternalLinks(True)
+        link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        parent.addWidget(link)
+
+    def _build_workshop_browser_view(self):
+        page = QWidget()
+        main_v = QVBoxLayout(page)
+        main_v.setContentsMargins(16, 8, 16, 8)
+        main_v.setSpacing(8)
+
+        # Search bar
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        self.ws_search = QLineEdit()
+        self.ws_search.setObjectName("SearchField")
+        self.ws_search.setPlaceholderText(self._("search_wallpapers"))
+        self.ws_search.returnPressed.connect(self._ws_search)
+        search_row.addWidget(self.ws_search)
+
+        btn_clear = QPushButton("X")
+        btn_clear.setObjectName("BarButton")
+        btn_clear.setFixedSize(30, 30)
+        btn_clear.clicked.connect(self._ws_clear_search)
+        search_row.addWidget(btn_clear)
+
+        self.ws_sort_combo = QComboBox()
+        self.ws_sort_combo.setFixedWidth(160)
+        for s in SortOrder:
+            self.ws_sort_combo.addItem(s.display_name, s)
+        self.ws_sort_combo.currentIndexChanged.connect(self._ws_sort_changed)
+        search_row.addWidget(self.ws_sort_combo)
+        main_v.addLayout(search_row)
+
+        # Tag filters
+        self.ws_tags_layout = QHBoxLayout()
+        self.ws_tags_layout.setSpacing(4)
+        tags_w = QWidget()
+        tags_w.setLayout(self.ws_tags_layout)
+        tags_scroll = QScrollArea()
+        tags_scroll.setWidget(tags_w)
+        tags_scroll.setWidgetResizable(True)
+        tags_scroll.setFixedHeight(34)
+        tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tags_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tags_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self._populate_tag_buttons()
+        main_v.addWidget(tags_scroll)
+
+        # Results stack
+        self.ws_results_stack = QStackedWidget()
+
+        # 0: Empty
+        empty = QWidget()
+        ev = QVBoxLayout(empty)
+        ev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl = QLabel(self._("search_workshop_title"))
+        lbl.setStyleSheet("font-size: 20px; font-weight: 600; color: #fff;")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ev.addWidget(lbl)
+        sub = QLabel(self._("search_workshop_desc"))
+        sub.setStyleSheet("font-size: 13px; color: #888;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ev.addWidget(sub)
+        self.ws_empty_api = QWidget()
+        api_v = QVBoxLayout(self.ws_empty_api)
+        api_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        api_hint = QLabel(self._("api_key_required"))
+        api_hint.setStyleSheet("font-size: 12px; color: #888;")
+        api_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        api_v.addWidget(api_hint)
+        self._add_api_key_row(api_v)
+        self.ws_empty_api.setVisible(not bool(self.workshop_api_key))
+        ev.addWidget(self.ws_empty_api)
+        self.ws_results_stack.addWidget(empty)
+
+        # 1: Loading
+        loading = QWidget()
+        lv = QVBoxLayout(loading)
+        lv.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ll = QLabel(self._("searching_workshop"))
+        ll.setStyleSheet("font-size: 14px; color: #888;")
+        ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lv.addWidget(ll)
+        self.ws_results_stack.addWidget(loading)
+
+        # 2: Error
+        err_page = QWidget()
+        erv = QVBoxLayout(err_page)
+        erv.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ws_error_lbl = QLabel("")
+        self.ws_error_lbl.setStyleSheet("font-size: 13px; color: #FF453A;")
+        self.ws_error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ws_error_lbl.setWordWrap(True)
+        erv.addWidget(self.ws_error_lbl)
+        self._add_api_key_row(erv)
+        self.ws_results_stack.addWidget(err_page)
+
+        # 3: Results grid
+        results_w = QWidget()
+        results_v = QVBoxLayout(results_w)
+        results_v.setContentsMargins(0, 0, 0, 0)
+        self.ws_scroll = QScrollArea()
+        self.ws_scroll.setWidgetResizable(True)
+        self.ws_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.ws_grid_widget = QWidget()
+        self.ws_scroll.setWidget(self.ws_grid_widget)
+        results_v.addWidget(self.ws_scroll)
+        self.btn_load_more = QPushButton(self._("load_more"))
+        self.btn_load_more.setObjectName("SecBtn")
+        self.btn_load_more.clicked.connect(self._ws_load_more)
+        self.btn_load_more.hide()
+        results_v.addWidget(self.btn_load_more, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.ws_results_stack.addWidget(results_w)
+
+        self.ws_results_stack.setCurrentIndex(0)
+        main_v.addWidget(self.ws_results_stack, 1)
+        self.workshop_stack.addWidget(page)
+
+    # ── Workshop Helpers ────────────────────────────────────────────────
+
+    def _populate_tag_buttons(self):
+        while self.ws_tags_layout.count():
+            child = self.ws_tags_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        lbl_r = QLabel(self._("rating_label"))
+        lbl_r.setStyleSheet("font-size: 11px; color: #888;")
+        self.ws_tags_layout.addWidget(lbl_r)
+        for t in CONTENT_RATING_TAGS: self._add_tag_btn(t)
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine); sep.setFixedHeight(20); sep.setStyleSheet("color: #333;")
+        self.ws_tags_layout.addWidget(sep)
+        lbl_t = QLabel(self._("type_label"))
+        lbl_t.setStyleSheet("font-size: 11px; color: #888;")
+        self.ws_tags_layout.addWidget(lbl_t)
+        for t in TYPE_TAGS: self._add_tag_btn(t)
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine); sep2.setFixedHeight(20); sep2.setStyleSheet("color: #333;")
+        self.ws_tags_layout.addWidget(sep2)
+        for t in GENRE_TAGS: self._add_tag_btn(t)
+        self.ws_tags_layout.addStretch()
+
+    def _add_tag_btn(self, tag):
+        btn = QPushButton(tag)
+        active = tag in self.workshop_selected_tags
+        btn.setObjectName("TagBtnActive" if active else "TagBtn")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(24)
+        btn.clicked.connect(lambda _, t=tag: self._toggle_ws_tag(t))
+        self.ws_tags_layout.addWidget(btn)
+
+    def _toggle_ws_tag(self, tag):
+        if tag in self.workshop_selected_tags:
+            self.workshop_selected_tags.remove(tag)
+        else:
+            self.workshop_selected_tags.append(tag)
+        self._populate_tag_buttons()
+        self.workshop_page_num = 1
+        self._ws_search()
+
+    def _update_workshop_view_state(self):
+        if not self.steam_cmd.is_installed:
+            self.workshop_stack.setCurrentIndex(0)
+        elif not self.steam_cmd.is_logged_in:
+            self.workshop_stack.setCurrentIndex(1)
+        else:
+            self.workshop_stack.setCurrentIndex(2)
+
+    def _browse_steamcmd(self):
+        path = QFileDialog.getOpenFileName(self, self._("select_steamcmd"))[0]
+        if path and self.steam_cmd.set_custom_path(path):
+            self._update_workshop_view_state()
+
+    def _redetect_steamcmd(self):
+        self.steam_cmd.redetect()
+        self._update_workshop_view_state()
+        self.status_bar.showMessage(self._("steamcmd_found") if self.steam_cmd.is_installed else self._("steamcmd_still_not_found"))
+
+    def _steam_login(self):
+        u, p = self.steam_username_input.text().strip(), self.steam_password_input.text()
+        g = self.steam_guard_input.text().strip()
+        if not u or not p: return
+        self.btn_steam_login.setEnabled(False)
+        self.btn_steam_cached.setEnabled(False)
+        self.steam_login_progress.show()
+        self.steam_cmd.login(u, p, g)
+
+    def _steam_login_cached(self):
+        u = self.steam_username_input.text().strip()
+        if not u: return
+        self.btn_steam_login.setEnabled(False)
+        self.btn_steam_cached.setEnabled(False)
+        self.steam_login_progress.show()
+        self.steam_cmd.login_cached(u)
+
+    def _on_steam_login_changed(self):
+        self.btn_steam_login.setEnabled(True)
+        self.btn_steam_cached.setEnabled(True)
+        self.steam_login_progress.setVisible(self.steam_cmd.is_logging_in)
+        if self.steam_cmd.login_error:
+            self.steam_login_error.setText(self.steam_cmd.login_error)
+            self.steam_login_error.show()
+            if "Steam Guard" in self.steam_cmd.login_error:
+                self.steam_guard_input.show()
+        elif self.steam_cmd.is_logged_in:
+            self.steam_login_error.hide()
+            self._update_workshop_view_state()
+            if not self.workshop_items:
+                self._ws_search()
+
+    def _save_api_key_from(self, key_text):
+        key = key_text.strip()
+        if key:
+            self.workshop_api_key = key
+            self.config["steam_api_key"] = key
             self.save_config()
+            if hasattr(self, 'ws_empty_api'):
+                self.ws_empty_api.hide()
+            self._ws_search()
+
+    def _ws_search(self):
+        self.workshop_page_num = 1
+        self.workshop_items = []
+        self.workshop_search_text = self.ws_search.text().strip() if hasattr(self, 'ws_search') else ""
+        self.ws_results_stack.setCurrentIndex(1)
+        self._do_ws_search()
+
+    def _ws_load_more(self):
+        self.workshop_page_num += 1
+        self.btn_load_more.setEnabled(False)
+        self._do_ws_search(append=True)
+
+    def _ws_sort_changed(self):
+        self.workshop_sort_order = self.ws_sort_combo.currentData()
+        self.workshop_page_num = 1
+        self.workshop_items = []
+        self.ws_results_stack.setCurrentIndex(1)
+        self._do_ws_search()
+
+    def _ws_clear_search(self):
+        self.ws_search.clear()
+        self._ws_search()
+
+    def _do_ws_search(self, append=False):
+        def _search():
+            return search_items(
+                api_key=self.workshop_api_key,
+                query=self.workshop_search_text,
+                tags=self.workshop_selected_tags,
+                sort_order=self.workshop_sort_order,
+                page=self.workshop_page_num,
+            )
+        self._ws_thread = QThread()
+        self._ws_worker = Worker(_search)
+        self._ws_worker.moveToThread(self._ws_thread)
+        self._ws_thread.started.connect(self._ws_worker.run)
+        self._ws_worker.finished.connect(lambda r: self._ws_search_done(r, append))
+        self._ws_worker.finished.connect(self._ws_thread.quit)
+        self._ws_worker.finished.connect(self._ws_worker.deleteLater)
+        self._ws_thread.finished.connect(self._ws_thread.deleteLater)
+        self._ws_thread.start()
+
+    def _ws_search_done(self, result, append=False):
+        self.btn_load_more.setEnabled(True)
+        if isinstance(result, Exception):
+            self.ws_error_lbl.setText(str(result))
+            self.ws_results_stack.setCurrentIndex(2)
+            return
+        if isinstance(result, list):
+            if append:
+                self.workshop_items.extend(result)
+            else:
+                self.workshop_items = result
+            if not self.workshop_items:
+                self.ws_results_stack.setCurrentIndex(0)
+                return
+            self._render_ws_grid()
+            self.ws_results_stack.setCurrentIndex(3)
+            self.btn_load_more.setVisible(len(result) >= 20)
+
+    def _render_ws_grid(self):
+        old = self.ws_grid_widget
+        self.ws_grid_widget = QWidget()
+        self.ws_grid_widget.setStyleSheet("background: transparent;")
+        grid = QGridLayout(self.ws_grid_widget)
+        grid.setSpacing(12)
+        grid.setContentsMargins(4, 4, 4, 4)
+        cols = max(1, (self.width() - 400) // 220)
+        for i, item in enumerate(self.workshop_items):
+            card = self._make_ws_card(item)
+            grid.addWidget(card, i // cols, i % cols)
+        self.ws_scroll.setWidget(self.ws_grid_widget)
+        old.deleteLater()
+
+    def _make_ws_card(self, item: WorkshopItem) -> QWidget:
+        card = QFrame()
+        card.setObjectName("WorkshopCard")
+        card.setFixedSize(200, 210)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(0, 0, 0, 8)
+        v.setSpacing(4)
+
+        img = QLabel()
+        img.setFixedSize(200, 112)
+        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img.setStyleSheet("background: #111; border-top-left-radius: 8px; border-top-right-radius: 8px; border: none;")
+        v.addWidget(img)
+        if item.preview_url:
+            self._load_preview_async(item.preview_url, img)
+
+        info = QVBoxLayout()
+        info.setContentsMargins(8, 2, 8, 0)
+        info.setSpacing(2)
+        t = QLabel(item.title)
+        t.setStyleSheet("font-size: 12px; font-weight: 500; color: #fff;")
+        t.setWordWrap(True)
+        t.setMaximumHeight(32)
+        info.addWidget(t)
+
+        meta = QHBoxLayout()
+        meta.setSpacing(4)
+        if item.tags:
+            tl = QLabel(", ".join(item.tags[:2]))
+            tl.setStyleSheet("font-size: 11px; color: #888;")
+            meta.addWidget(tl)
+        meta.addStretch()
+        if item.subscriptions > 0:
+            sl = QLabel(self._fmt_count(item.subscriptions))
+            sl.setStyleSheet("font-size: 11px; color: #888;")
+            meta.addWidget(sl)
+        info.addLayout(meta)
+
+        dl = self.steam_cmd.download_progress.get(item.id)
+        if dl and dl.status == DownloadStatus.DOWNLOADING:
+            s = QLabel(dl.message)
+            s.setStyleSheet("font-size: 11px; color: #888;")
+            info.addWidget(s)
+        elif dl and dl.status == DownloadStatus.COMPLETED:
+            s = QLabel(self._("downloaded"))
+            s.setStyleSheet("font-size: 11px; color: #30D158;")
+            info.addWidget(s)
+        elif dl and dl.status == DownloadStatus.FAILED:
+            s = QLabel(self._("failed"))
+            s.setStyleSheet("font-size: 11px; color: #FF453A;")
+            s.setToolTip(dl.message)
+            info.addWidget(s)
+        elif self.steam_cmd.is_logged_in:
+            b = QPushButton(self._("download"))
+            b.setObjectName("DlBtn")
+            b.setFixedHeight(22)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _, wid=item.id: self._download_ws_item(wid))
+            info.addWidget(b)
+        else:
+            s = QLabel(self._("login_to_download"))
+            s.setStyleSheet("font-size: 11px; color: #666;")
+            info.addWidget(s)
+
+        v.addLayout(info)
+        return card
+
+    def _load_preview_async(self, url, label):
+        if url in self._workshop_image_cache:
+            pm = self._workshop_image_cache[url]
+            label.setPixmap(pm.scaled(200, 112, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+            return
+        def _fetch():
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.read()
+            except:
+                return None
+        thread = QThread()
+        worker = Worker(_fetch)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        def _done(data):
+            if data:
+                img = QImage()
+                img.loadFromData(data)
+                pm = QPixmap.fromImage(img)
+                self._workshop_image_cache[url] = pm
+                label.setPixmap(pm.scaled(200, 112, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+        worker.finished.connect(_done)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._img_threads.append(thread)
+        thread.start()
+
+    def _download_ws_item(self, wid):
+        dirs = self.get_steam_workshop_dirs()
+        dest = list(dirs)[0] if dirs else os.path.expanduser("~/.local/share/Steam/steamapps/workshop/content/431960")
+        os.makedirs(dest, exist_ok=True)
+        self.steam_cmd.download_workshop_item(wid, dest)
+        self._render_ws_grid()
+
+    def _on_download_updated(self, wid):
+        if self.ws_results_stack.currentIndex() == 3:
+            self._render_ws_grid()
+        dl = self.steam_cmd.download_progress.get(wid)
+        if dl and dl.status == DownloadStatus.COMPLETED:
+            self.start_scan()
+
+    @staticmethod
+    def _fmt_count(n):
+        if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+        if n >= 1_000: return f"{n/1_000:.1f}K"
+        return str(n)
+
+    # ── Library / Scanning ──────────────────────────────────────────────
+
+    def on_library_changed_auto(self):
+        if self.btn_scan.isEnabled():
+            self.start_scan()
+
+    def get_steam_workshop_dirs(self):
+        workshop_dirs = set()
+        base_paths = [
+            os.path.expanduser("~/.local/share/Steam"),
+            os.path.expanduser("~/.steam/steam"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.data/Steam"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.steam/steam"),
+        ]
+        lib_configs = [
+            os.path.expanduser("~/.local/share/Steam/steamapps/libraryfolders.vdf"),
+            os.path.expanduser("~/.steam/steam/steamapps/libraryfolders.vdf"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/libraryfolders.vdf")
+        ]
+        for cfg in lib_configs:
+            if os.path.isfile(cfg):
+                try:
+                    with open(cfg, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        paths = re.findall(r'"path"\s+"([^"]+)"', content)
+                        for p in paths:
+                            if os.path.isdir(p):
+                                base_paths.append(p)
+                except: pass
+        base_paths = list(set(base_paths))
+        base_paths.extend(glob.glob(os.path.expanduser("~/snap/steam/*/.local/share/Steam")))
+        base_paths.extend(glob.glob(os.path.expanduser("~/snap/steam/*/.steam/steam")))
+        for base in base_paths:
+            if not os.path.exists(base): continue
+            p_workshop = os.path.join(base, "steamapps/workshop/content/431960")
+            if os.path.isdir(p_workshop):
+                workshop_dirs.add(p_workshop)
+            p_presets = os.path.join(base, "steamapps/common/wallpaper_engine/assets/presets")
+            if os.path.isdir(p_presets):
+                workshop_dirs.add(p_presets)
+        if not workshop_dirs:
+            try:
+                search_roots = [os.path.expanduser("~")]
+                cmd = ["find"] + search_roots + ["-maxdepth", "6", "-type", "d", "-name", "431960"]
+                result = subprocess.run(cmd, capture_output=True, text=True, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if os.path.isdir(line):
+                            workshop_dirs.add(line)
+            except Exception as e:
+                logging.error(f"Deep scan error: {e}")
+        return workshop_dirs
+
+    def scan_logic(self, manual_dir=None):
+        workshop_dirs = self.get_steam_workshop_dirs()
+        is_append = manual_dir is not None
+        if manual_dir:
+            workshop_dirs.add(manual_dir)
+        wallpapers = []
+        seen = set()
+        for w_dir in workshop_dirs:
+            try:
+                proj_self = os.path.join(w_dir, "project.json")
+                if os.path.isfile(proj_self):
+                    try:
+                        with open(proj_self, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            item_id = os.path.basename(w_dir)
+                            wallpapers.append({"title": data.get("title", "Untitled"), "id": item_id, "path": w_dir, "preview": data.get("preview")})
+                            seen.add(item_id)
+                    except: pass
+                for item_id in os.listdir(w_dir):
+                    if item_id in seen: continue
+                    path = os.path.join(w_dir, item_id)
+                    proj = os.path.join(path, "project.json")
+                    if os.path.isfile(proj):
+                        try:
+                            with open(proj, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                wallpapers.append({"title": data.get("title", "Untitled"), "id": item_id, "path": path, "preview": data.get("preview")})
+                                seen.add(item_id)
+                        except: pass
+            except: pass
+        return wallpapers, is_append, list(workshop_dirs)
 
     def start_scan(self):
-        self.status_bar.showMessage(self._("status_searching_local"))
+        self.status_bar.showMessage(self._("scanning_wallpapers"))
         self.btn_scan.setEnabled(False)
         self.search_input.clear()
         self.thread = QThread()
@@ -611,11 +1512,10 @@ class WallpaperApp(QMainWindow):
         self.thread.start()
 
     def manual_scan(self):
-        directory = QFileDialog.getExistingDirectory(self, self._("select_folder_button"))
+        directory = QFileDialog.getExistingDirectory(self, self._("select_wallpaper_folder"))
         if directory:
-            self.status_bar.showMessage(self._("status_searching_local"))
+            self.status_bar.showMessage(self._("scanning_folder"))
             self.btn_scan.setEnabled(False)
-            self.search_input.clear()
             self.thread = QThread()
             self.worker = Worker(self.scan_logic, manual_dir=directory)
             self.worker.moveToThread(self.thread)
@@ -626,121 +1526,14 @@ class WallpaperApp(QMainWindow):
             self.thread.finished.connect(self.thread.deleteLater)
             self.thread.start()
 
-    def get_steam_workshop_dirs(self):
-        workshop_dirs = set()
-        base_paths = [
-            os.path.expanduser("~/.local/share/Steam"),
-            os.path.expanduser("~/.steam/steam"),
-            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam"),
-            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.data/Steam"),
-            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.steam/steam"),
-        ]
-
-        # Library folders from VDF
-        lib_configs = [
-            os.path.expanduser("~/.local/share/Steam/steamapps/libraryfolders.vdf"),
-            os.path.expanduser("~/.steam/steam/steamapps/libraryfolders.vdf"),
-            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/libraryfolders.vdf")
-        ]
-
-        for cfg in lib_configs:
-            if os.path.isfile(cfg):
-                try:
-                    with open(cfg, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        # Simple regex to find paths in VDF
-                        paths = re.findall(r'"path"\s+"([^"]+)"', content)
-                        for p in paths:
-                            if os.path.isdir(p):
-                                base_paths.append(p)
-                except: pass
-
-        # Deduplicate
-        base_paths = list(set(base_paths))
-
-        # Add Snap paths
-        base_paths.extend(glob.glob(os.path.expanduser("~/snap/steam/*/.local/share/Steam")))
-        base_paths.extend(glob.glob(os.path.expanduser("~/snap/steam/*/.steam/steam")))
-
-        for base in base_paths:
-            if not os.path.exists(base): continue
-
-            # Standard workshop path for Wallpaper Engine (ID: 431960)
-            p_workshop = os.path.join(base, "steamapps/workshop/content/431960")
-            if os.path.isdir(p_workshop):
-                workshop_dirs.add(p_workshop)
-
-            # Default assets
-            p_presets = os.path.join(base, "steamapps/common/wallpaper_engine/assets/presets")
-            if os.path.isdir(p_presets):
-                workshop_dirs.add(p_presets)
-
-        # Fallback deep scan if nothing found
-        if not workshop_dirs:
-            try:
-                # Limit search to home directory to avoid scanning whole system
-                search_roots = [os.path.expanduser("~")]
-                cmd = ["find"] + search_roots + ["-maxdepth", "6", "-type", "d", "-name", "431960"]
-                result = subprocess.run(cmd, capture_output=True, text=True, stderr=subprocess.DEVNULL)
-                if result.returncode == 0:
-                    for line in result.stdout.splitlines():
-                        if os.path.isdir(line):
-                            workshop_dirs.add(line)
-            except Exception as e:
-                logging.error(f"Deep scan error: {e}")
-
-        return workshop_dirs
-
-    def scan_logic(self, manual_dir=None):
-        workshop_dirs = self.get_steam_workshop_dirs()
-        is_append = manual_dir is not None
-        if manual_dir:
-            workshop_dirs.add(manual_dir)
-
-        wallpapers = []
-        seen = set()
-
-        for w_dir in workshop_dirs:
-            try:
-                proj_self = os.path.join(w_dir, "project.json")
-                if os.path.isfile(proj_self):
-                    try:
-                        with open(proj_self, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            item_id = os.path.basename(w_dir)
-                            wallpapers.append({
-                                "title": data.get("title", "Untitled"),
-                                "id": item_id,
-                                "path": w_dir,
-                                "preview": data.get("preview")
-                            })
-                            seen.add(item_id)
-                    except: pass
-                for item_id in os.listdir(w_dir):
-                    if item_id in seen: continue
-                    path = os.path.join(w_dir, item_id)
-                    proj = os.path.join(path, "project.json")
-                    if os.path.isfile(proj):
-                        try:
-                            with open(proj, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                                wallpapers.append({
-                                    "title": data.get("title", "Untitled"),
-                                    "id": item_id,
-                                    "path": path,
-                                    "preview": data.get("preview")
-                                })
-                                seen.add(item_id)
-                        except: pass
-            except: pass
-
-        return wallpapers, is_append, list(workshop_dirs)
-
     def scan_finished(self, result):
+        if isinstance(result, Exception):
+            self.btn_scan.setEnabled(True)
+            self.status_bar.showMessage(self._("scan_error", error=result))
+            return
         wallpapers, is_append, scanned_dirs = result
         if hasattr(self, 'watcher'):
             self.watcher.update_watches(scanned_dirs)
-
         if not is_append:
             self.list_wallpapers.clear()
         existing_ids = set()
@@ -752,117 +1545,109 @@ class WallpaperApp(QMainWindow):
         for w in wallpapers:
             if w["id"] in existing_ids: continue
             item = QListWidgetItem(w["title"])
-            item.setSizeHint(QSize(200, 240))
+            item.setSizeHint(QSize(180, 200))
             item_font = QFont()
             item_font.setPointSize(10)
-            item_font.setWeight(700)
+            item_font.setWeight(600)
             item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignCenter)
             item.setFont(item_font)
             item.setData(Qt.ItemDataRole.UserRole, w)
-
             if w.get("preview"):
                 path = os.path.join(w["path"], w["preview"])
                 if os.path.isfile(path):
                     pixmap = QPixmap(path)
-
-                    icon_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-
-
-                    rect = QRect(0, 0, 200, 200)
+                    icon_pixmap = pixmap.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                    rect = QRect(0, 0, 160, 160)
                     rect.moveCenter(icon_pixmap.rect().center())
                     icon_pixmap = icon_pixmap.copy(rect)
-
                     item.setIcon(QIcon(icon_pixmap))
-
             self.list_wallpapers.addItem(item)
             existing_ids.add(w["id"])
             new_count += 1
         self.btn_scan.setEnabled(True)
         if is_append:
-            self.status_bar.showMessage(f"Added {new_count} new wallpapers.")
+            self.status_bar.showMessage(self._("added_wallpapers", count=new_count))
         else:
-            self.status_bar.showMessage(self._("status_local_wallpapers_found").format(count=self.list_wallpapers.count()))
+            self.status_bar.showMessage(self._("found_wallpapers", count=self.list_wallpapers.count()))
 
     def on_wallpaper_selected(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
         self.wp_id_input.setText(data["id"])
+        self._update_preview(data)
+
+    def _update_preview(self, data):
+        self.preview_title.setText(data.get("title", "Untitled"))
+        # Load preview image
+        if data.get("preview"):
+            path = os.path.join(data["path"], data["preview"])
+            if os.path.isfile(path):
+                pm = QPixmap(path).scaled(240, 240, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self.preview_image.setPixmap(pm)
+                self.preview_image.setText("")
+        # Meta info
+        proj_path = os.path.join(data["path"], "project.json")
+        wp_type = ""
+        wp_tags = []
+        if os.path.isfile(proj_path):
+            try:
+                with open(proj_path, 'r', encoding='utf-8') as f:
+                    proj = json.load(f)
+                wp_type = proj.get("type", "")
+                wp_tags = proj.get("tags", [])
+            except: pass
+        try:
+            total = sum(f.stat().st_size for f in pathlib.Path(data["path"]).rglob("*") if f.is_file())
+            size_str = f"{total / 1048576:.1f} MB"
+        except:
+            size_str = "? MB"
+        self.preview_meta.setText(f"{wp_type}   {size_str}")
+        # Tags
+        while self.preview_tags_layout.count():
+            child = self.preview_tags_layout.takeAt(0)
+            if child.widget(): child.widget().deleteLater()
+        for tag in wp_tags[:6]:
+            lbl = QLabel(tag)
+            lbl.setObjectName("PreviewTag")
+            self.preview_tags_layout.addWidget(lbl)
 
     def filter_wallpapers(self, text):
         query = text.lower()
-
         if query:
             self.watcher.timer.stop()
-
         else:
             self.watcher.timer.start()
-
         for i in range(self.list_wallpapers.count()):
             item = self.list_wallpapers.item(i)
             data = item.data(Qt.ItemDataRole.UserRole)
             title = item.text().lower()
             wp_id = str(data.get("id", "")).lower()
             item.setHidden(query not in title and query not in wp_id)
-    
+
     def on_sort_change(self):
         try:
-            # Save sorting type to config
-            self.config["sorting_type"] = self.sorting_type.currentText()
+            self.config["sorting_type"] = self.sorting_type.currentIndex()
             self.save_config()
-
             if self.list_wallpapers:
-                wallpapers = self.list_wallpapers
-
-            if wallpapers:
-                self.thread = QThread()
-                self.worker = Worker(self.sort_wallpapers, wallpapers)
-                self.worker.moveToThread(self.thread)
-                self.thread.started.connect(self.worker.run)
-                self.worker.finished.connect(self.thread.quit)
-                self.thread.finished.connect(self.worker.deleteLater)
                 self.watcher.library_changed.emit()
-                self.thread.start()
-
-        except FileNotFoundError:
-            return 0
-
-        except Exception as e:
-            print(f"Error of type {e}")
-            return 0
-
+        except: pass
 
     def sort_wallpapers(self, wallpapers):
         try:
-
-            if self.sorting_type.currentText() == "Name":
-                if not self.sort_reversed_state:
-                    wallpapers.sort(key=lambda x: x["title"].lower())
-                else:
-                    wallpapers.sort(key=lambda x: x["title"].lower(), reverse=True)
-
-            elif self.sorting_type.currentText() == "Subscription Date":
-                if not self.sort_reversed_state:
-                    # By default needs to be reversed to get the latest subscriptions
-                    wallpapers.sort(key=lambda x: pathlib.Path(x["path"]).stat().st_ctime, reverse=True)
-                else:
-                    wallpapers.sort(key=lambda x: pathlib.Path(x["path"]).stat().st_ctime, reverse=False)
-        except FileNotFoundError:
-            return 0
-
-        except Exception as e:
-            print(f"Error of type {e}")
-            return 0
+            idx = self.sorting_type.currentIndex()
+            if idx == 0:  # Name
+                wallpapers.sort(key=lambda x: x["title"].lower(), reverse=self.sort_reversed_state)
+            elif idx == 1:  # Subscription Date
+                wallpapers.sort(key=lambda x: pathlib.Path(x["path"]).stat().st_ctime, reverse=not self.sort_reversed_state)
+        except: pass
 
     def reverse_sorted(self):
-        if not self.sort_reversed_state:
-            self.sort_reversed_state = True
-            self.btn_reverse_sorted.setText("↓")
-        else:
-            self.btn_reverse_sorted.setText("↑")
-            self.sort_reversed_state = False
-
+        self.sort_reversed_state = not self.sort_reversed_state
+        self.btn_reverse_sorted.setText("↓" if self.sort_reversed_state else "↑")
         self.config["reversed"] = self.sort_reversed_state
         self.save_config()
         self.watcher.library_changed.emit()
+
+    # ── Properties ──────────────────────────────────────────────────────
 
     def on_property_selected(self):
         data = self.properties_combo.currentData()
@@ -881,13 +1666,11 @@ class WallpaperApp(QMainWindow):
 
     def apply_property_value(self):
         data = self.properties_combo.currentData()
-        if not isinstance(data, dict):
-            return
+        if not isinstance(data, dict): return
         value = self.properties_value.text().strip()
         data["value"] = value
         name = data.get("name", "")
-        if name:
-            self.properties_data[name] = data
+        if name: self.properties_data[name] = data
         idx = self.properties_combo.currentIndex()
         self.properties_combo.setItemData(idx, data)
         self.run_wallpaper()
@@ -895,15 +1678,10 @@ class WallpaperApp(QMainWindow):
     def populate_properties_combo(self, props_dict):
         self.properties_combo.blockSignals(True)
         self.properties_combo.clear()
-        self.properties_combo.addItem(self._("properties_select_placeholder"), None)
+        self.properties_combo.addItem(self._("select_property"), None)
         self.properties_data = {}
         for name, data in props_dict.items():
-            item = {
-                "name": name,
-                "value": data.get("value", ""),
-                "sep": data.get("sep", "="),
-                "type": data.get("type", ""),
-            }
+            item = {"name": name, "value": data.get("value", ""), "sep": data.get("sep", "="), "type": data.get("type", "")}
             self.properties_data[name] = item
             self.properties_combo.addItem(name, item)
         self.properties_combo.setCurrentIndex(0)
@@ -917,23 +1695,15 @@ class WallpaperApp(QMainWindow):
 
     def parse_properties_output(self, output):
         props = []
-
         text = output.strip()
         if text:
-            try:
-                parsed = json.loads(text)
-            except Exception:
-                parsed = None
-
+            try: parsed = json.loads(text)
+            except: parsed = None
             if parsed is None:
-                start = text.find("{")
-                end = text.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    try:
-                        parsed = json.loads(text[start:end + 1])
-                    except Exception:
-                        parsed = None
-
+                start, end = text.find("{"), text.rfind("}")
+                if start != -1 and end > start:
+                    try: parsed = json.loads(text[start:end+1])
+                    except: parsed = None
             if isinstance(parsed, dict):
                 for name, value in parsed.items():
                     props.append((str(name), str(value), "=", ""))
@@ -942,22 +1712,17 @@ class WallpaperApp(QMainWindow):
                 for item in parsed:
                     if isinstance(item, dict):
                         name = item.get("name") or item.get("property") or item.get("key")
-                        if name is None:
-                            continue
-                        value = item.get("value", "")
-                        props.append((str(name), str(value), "=", ""))
+                        if name is None: continue
+                        props.append((str(name), str(item.get("value", "")), "=", ""))
                     elif isinstance(item, str):
                         props.append((item, "", "=", ""))
-                if props:
-                    return props
-
+                if props: return props
         lines = output.splitlines()
         current_name = None
         current_type = ""
         for line in lines:
             stripped = line.strip()
-            if not stripped:
-                continue
+            if not stripped: continue
             if stripped.startswith("_") or " - " in stripped:
                 parts = stripped.split(" - ", 1)
                 if parts:
@@ -971,21 +1736,14 @@ class WallpaperApp(QMainWindow):
                     current_name = None
                     current_type = ""
                 continue
-
-        if props:
-            return props
-
+        if props: return props
         for line in lines:
             line = line.strip()
-            if not line:
-                continue
+            if not line: continue
             lower = line.lower()
-            if lower.startswith("properties") or line.startswith("#"):
-                continue
-            if lower.startswith("running with") or lower.startswith("particle "):
-                continue
-            if lower.startswith("found user setting with script value"):
-                continue
+            if lower.startswith("properties") or line.startswith("#"): continue
+            if lower.startswith("running with") or lower.startswith("particle "): continue
+            if lower.startswith("found user setting with script value"): continue
             if "=" in line:
                 name, value = line.split("=", 1)
                 sep = "="
@@ -997,10 +1755,8 @@ class WallpaperApp(QMainWindow):
                 name = parts[0]
                 value = parts[1] if len(parts) > 1 else ""
                 sep = "="
-            name = name.strip()
-            value = value.strip()
-            if name:
-                props.append((name, value, sep, ""))
+            name, value = name.strip(), value.strip()
+            if name: props.append((name, value, sep, ""))
         return props
 
     def list_properties_logic(self, wallpaper_id):
@@ -1015,22 +1771,21 @@ class WallpaperApp(QMainWindow):
             stdout, stderr = proc.communicate(timeout=2)
         returncode = proc.returncode if proc.returncode is not None else 0
         combined = (stdout or "")
-        if stderr:
-            combined = (combined + "\n" + stderr).strip()
+        if stderr: combined = (combined + "\n" + stderr).strip()
         return returncode, combined, stderr or "", timed_out, wallpaper_id
 
     def load_properties(self):
-        wallpaper_id = self.wp_id_input.text().strip()
-        if not wallpaper_id:
-            self.status_bar.showMessage(self._("status_error_empty_id"))
+        wid = self.wp_id_input.text().strip()
+        if not wid:
+            self.status_bar.showMessage(self._("no_wallpaper_selected_status"))
             return
         if not shutil.which("linux-wallpaperengine"):
-            self.status_bar.showMessage("Error: linux-wallpaperengine not found")
+            self.status_bar.showMessage(self._("engine_not_found"))
             return
-        self.status_bar.showMessage(self._("status_loading_properties"))
+        self.status_bar.showMessage(self._("loading_properties_status"))
         self.btn_load_props.setEnabled(False)
         self.props_thread = QThread()
-        self.props_worker = Worker(self.list_properties_logic, wallpaper_id)
+        self.props_worker = Worker(self.list_properties_logic, wid)
         self.props_worker.moveToThread(self.props_thread)
         self.props_thread.started.connect(self.props_worker.run)
         self.props_worker.finished.connect(self.load_properties_finished)
@@ -1040,31 +1795,35 @@ class WallpaperApp(QMainWindow):
         self.props_thread.start()
 
     def load_properties_finished(self, result):
+        if isinstance(result, Exception):
+            self.btn_load_props.setEnabled(True)
+            self.status_bar.showMessage(self._("properties_error", error=result))
+            return
         returncode, stdout, stderr, timed_out, wallpaper_id = result
         self.btn_load_props.setEnabled(True)
         if returncode != 0 and not timed_out:
-            msg = stderr.strip() or "Unknown error"
-            self.status_bar.showMessage(self._("status_properties_load_failed").format(error=msg))
+            self.status_bar.showMessage(self._("properties_failed", error=stderr.strip() or 'Unknown error'))
             return
         props = self.parse_properties_output(stdout)
         stored = self.config.get("properties_by_wallpaper", {}).get(wallpaper_id, {})
         merged = {}
         for name, value, sep, prop_type in props:
             data = {"name": name, "value": value, "sep": sep, "type": prop_type}
-            if name in stored:
-                data["value"] = stored[name].get("value", value)
+            if name in stored: data["value"] = stored[name].get("value", value)
             merged[name] = data
         self.populate_properties_combo(merged)
-        if props:
-            if timed_out:
-                self.status_bar.showMessage(self._("status_properties_loaded_timeout").format(count=len(props)))
-            else:
-                self.status_bar.showMessage(self._("status_properties_loaded").format(count=len(props)))
+        count = len(props)
+        if timed_out:
+            self.status_bar.showMessage(self._("loaded_properties_timeout", count=count))
         else:
-            if timed_out:
-                self.status_bar.showMessage(self._("status_properties_none_timeout"))
-            else:
-                self.status_bar.showMessage(self._("status_properties_none"))
+            self.status_bar.showMessage(self._("loaded_properties", count=count))
+
+    def on_wallpaper_id_changed(self):
+        wid = self.wp_id_input.text().strip()
+        stored = self.config.get("properties_by_wallpaper", {}).get(wid, {})
+        self.populate_properties_combo(stored)
+
+    # ── Wallpaper Execution ─────────────────────────────────────────────
 
     def kill_external_wallpapers(self):
         self.wallpaper_proc_manager.kill_external("linux-wallpaperengine")
@@ -1072,24 +1831,18 @@ class WallpaperApp(QMainWindow):
     def run_wallpaper(self):
         if not shutil.which("linux-wallpaperengine"):
             from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Error",
-                "The backend 'linux-wallpaperengine' was not found in your PATH.\n\n"
-                "Please install it first. See README.md for instructions.")
-            self.status_bar.showMessage("Error: linux-wallpaperengine not found")
+            QMessageBox.critical(self, self._("error_title"), self._("engine_not_found_dialog"))
+            self.status_bar.showMessage(self._("engine_not_found"))
             return
-
         cmd = ['linux-wallpaperengine']
         screen_name = self.screen_combo.currentText()
-
         if self.chk_windowed_mode.isChecked():
             geom = "0x0x1920x1080"
             found = next((s for s in self.screens if s["name"] == screen_name), None)
-            if found:
-                geom = f"{found['x']}x{found['y']}x{found['w']}x{found['h']}"
+            if found: geom = f"{found['x']}x{found['y']}x{found['w']}x{found['h']}"
             cmd.extend(['--window', geom])
         else:
             cmd.extend(['--screen-root', screen_name])
-
         cmd.extend(['--bg', self.wp_id_input.text()])
         if self.chk_silent.isChecked(): cmd.append('--silent')
         elif self.slider_volume.value() != 15: cmd.extend(['--volume', str(self.slider_volume.value())])
@@ -1112,56 +1865,41 @@ class WallpaperApp(QMainWindow):
                 cmd.extend(['--set-property', f"{name}{sep}{value}"])
         custom_args = self.input_custom_args.text()
         if custom_args:
-             for arg in custom_args.split(): cmd.append(arg)
+            for arg in custom_args.split(): cmd.append(arg)
         self.stop_wallpapers()
         try:
             self.wallpaper_proc_manager.start(cmd)
-            self.status_bar.showMessage(self._("status_command_launched"))
+            self.status_bar.showMessage(self._("wallpaper_started"))
             self.save_config()
         except Exception as e:
-            logging.error("Couldn't run with error %s", e)
+            logging.error("Couldn't run: %s", e)
             self.status_bar.showMessage(f"Error: {e}")
 
     def show_log_file(self):
         log_path = self.wallpaper_proc_manager.log_path()
         if not log_path.exists():
-            self.status_bar.showMessage("Log file not found.")
+            self.status_bar.showMessage(self._("log_not_found"))
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
 
     def stop_wallpapers(self):
-        stopped_internal = False
+        stopped = False
         if self.wallpaper_proc_manager.is_running():
-            try:
-                stopped_internal = self.wallpaper_proc_manager.stop(timeout=1)
-            except Exception as e:
-                logging.error("Couldn't stop internal wallpaper process: %s", e)
-
-        # Fallback: If we didn't stop a child process (e.g. GUI restarted),
-        # ensure we clean up any orphaned linux-wallpaperengine processes.
-        # This restores the "force stop" capability users expect.
-        if not stopped_internal:
+            try: stopped = self.wallpaper_proc_manager.stop(timeout=1)
+            except Exception as e: logging.error("Stop error: %s", e)
+        if not stopped:
             self.kill_external_wallpapers()
-            self.status_bar.showMessage(self._("status_all_stopped"))
-        else:
-            self.status_bar.showMessage(self._("status_all_stopped"))
+        self.status_bar.showMessage(self._("wallpapers_stopped"))
 
     def check_wallpaper_process(self):
         result = self.wallpaper_proc_manager.check()
-        if result is None:
-            return
-        if result["expected"]:
-            return
-        returncode = result["returncode"]
-        if returncode == 0:
-            msg = "Wallpaper process exited."
-        else:
-            msg = f"Wallpaper process crashed (code {returncode})."
-        if result["log_path"]:
-            msg = f"{msg} Log: {result['log_path']}"
+        if result is None or result["expected"]: return
+        rc = result["returncode"]
+        msg = self._("wallpaper_exited") if rc == 0 else self._("wallpaper_crashed", code=rc)
+        if result["log_path"]: msg += f" Log: {result['log_path']}"
         self.status_bar.showMessage(msg)
         if hasattr(self, "tray") and self.tray.isVisible():
-            self.tray.showMessage("Wallpaper Engine", msg)
+            self.tray.showMessage(self._("wallpaper_engine"), msg)
 
     def restore_last_wallpaper(self):
         c = self.config.get("last_wallpaper", {})
@@ -1179,70 +1917,46 @@ class WallpaperApp(QMainWindow):
         self.input_custom_args.setText(c.get("custom_args", ""))
         self.chk_windowed_mode.setChecked(c.get("windowed_mode", False))
         self.run_wallpaper()
-        # Library Settings
-        self.sorting_type.setCurrentText(self.config.get("sorting_type", "name"))
+        sort_idx = self.config.get("sorting_type", 0)
+        if isinstance(sort_idx, str):
+            sort_idx = 0  # legacy config compat
+        self.sorting_type.setCurrentIndex(sort_idx)
         self.sort_reversed_state = self.config.get("reversed", False)
-        self.btn_reverse_sorted.setText("↑") if self.sort_reversed_state == False else self.btn_reverse_sorted.setText("↓")
+        self.btn_reverse_sorted.setText("↓" if self.sort_reversed_state else "↑")
         self.watcher.library_changed.emit()
+
+    # ── Config / Misc ───────────────────────────────────────────────────
 
     def detect_screens(self):
         screens = []
         try:
             res = subprocess.run(['xrandr', '--query'], capture_output=True, text=True)
-
-
             pattern = re.compile(r'^(\S+)\s+connected\s+(?:primary\s+)?(\d+)x(\d+)\+(\d+)\+(\d+)')
-
             for line in res.stdout.splitlines():
                 match = pattern.match(line)
                 if match:
                     name, w, h, x, y = match.groups()
-                    screens.append({
-                        "name": name,
-                        "w": w, "h": h, "x": x, "y": y
-                    })
+                    screens.append({"name": name, "w": w, "h": h, "x": x, "y": y})
         except Exception as e:
-            logging.error(f"Screen detection error: {e}")
-
+            logging.error(f"Screen detection: {e}")
         if not screens:
             screens = [{"name": "eDP-1", "w": "1920", "h": "1080", "x": "0", "y": "0"}]
-
         return screens
 
     def load_config_data(self):
         self.config = {}
-
-        # Ensure config directory exists
-        try:
-            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            logging.error(f"Failed to create config directory: {e}")
-
-        # Migration: Check for old config in current working directory
+        try: CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        except: pass
         old_config_path = pathlib.Path(__file__).parent / "wpe_gui_config.json"
         if old_config_path.exists() and not CONFIG_FILE.exists():
-            logging.info(f"Migrating config from {old_config_path} to {CONFIG_FILE}")
-            try:
-                shutil.move(str(old_config_path), str(CONFIG_FILE))
-            except Exception as e:
-                logging.error(f"Migration failed: {e}")
-
+            try: shutil.move(str(old_config_path), str(CONFIG_FILE))
+            except: pass
         if os.path.exists(CONFIG_FILE):
-            logging.info("Attempting to read config from: %s", CONFIG_FILE)
             try:
                 with open(CONFIG_FILE, 'r') as f: self.config = json.load(f)
-            except Exception as e:
-                logging.info("Failed to open config with error %s", e)
+            except: pass
         if "properties_by_wallpaper" not in self.config:
             self.config["properties_by_wallpaper"] = {}
-
-    def apply_config_ui(self):
-        pass
-
-    def on_wallpaper_id_changed(self):
-        wallpaper_id = self.wp_id_input.text().strip()
-        stored = self.config.get("properties_by_wallpaper", {}).get(wallpaper_id, {})
-        self.populate_properties_combo(stored)
 
     def save_config(self):
         self.config["last_wallpaper"] = {
@@ -1259,44 +1973,86 @@ class WallpaperApp(QMainWindow):
             "custom_args": self.input_custom_args.text(),
             "windowed_mode": self.chk_windowed_mode.isChecked(),
         }
-        wallpaper_id = self.wp_id_input.text().strip()
-        if wallpaper_id:
+        wid = self.wp_id_input.text().strip()
+        if wid:
             props_out = {}
             for name, data in self.properties_data.items():
-                props_out[name] = {
-                    "value": str(data.get("value", "")),
-                    "sep": data.get("sep", "="),
-                    "type": data.get("type", ""),
-                }
-            self.config.setdefault("properties_by_wallpaper", {})[wallpaper_id] = props_out
+                props_out[name] = {"value": str(data.get("value", "")), "sep": data.get("sep", "="), "type": data.get("type", "")}
+            self.config.setdefault("properties_by_wallpaper", {})[wid] = props_out
         try:
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, 'w') as f: json.dump(self.config, f, indent=4)
         except Exception as e:
-            logging.error("Couldn't save config with error %s", e)
+            logging.error("Save config error: %s", e)
+
+    def update_texts(self):
+        self.combo_lang.blockSignals(True)
+        self.combo_lang.clear()
+        for code, name in self.i18n.available_languages.items():
+            self.combo_lang.addItem(name, code)
+        self.combo_lang.setCurrentText(self.i18n.available_languages.get(self.i18n.current_code, "English"))
+        self.combo_lang.blockSignals(False)
+
+    def change_lang(self, text):
+        code = self.combo_lang.currentData()
+        if code and self.i18n.load(code):
+            self.config["current_language"] = code
+            self.save_config()
+            self._rebuild_ui()
+
+    def _rebuild_ui(self):
+        """Rebuild the entire UI to apply language changes."""
+        # Save current state
+        cur_tab = self.content_stack.currentIndex()
+        cur_wp = self.wp_id_input.text() if hasattr(self, 'wp_id_input') else ""
+        cur_screen = self.screen_combo.currentText() if hasattr(self, 'screen_combo') else ""
+        # Remove old central widget
+        old = self.centralWidget()
+        if old:
+            old.deleteLater()
+        self._api_key_inputs = []
+        # Rebuild
+        self.setup_ui()
+        self.setStyleSheet(STYLESHEET)
+        # Restore screens
+        self.screens = self.detect_screens()
+        for s in self.screens:
+            self.screen_combo.addItem(s["name"], s)
+        if cur_screen:
+            self.screen_combo.setCurrentText(cur_screen)
+        # Restore state
+        self.wp_id_input.setText(cur_wp)
+        self._switch_tab(cur_tab)
+        self.update_texts()
+        # Re-populate tray
+        self.setup_tray()
+        # Re-scan
+        self.start_scan()
+
+    # ── Tray ────────────────────────────────────────────────────────────
 
     def setup_tray(self):
         self.tray = QSystemTrayIcon(QApplication.instance())
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(QColor("#007AFF"))
         img = QImage(64, 64, QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.transparent)
-        from PyQt6.QtGui import QPainter, QBrush
         painter = QPainter(img)
-        painter.setBrush(QBrush(QColor("#007AFF")))
+        from PyQt6.QtGui import QBrush
+        painter.setBrush(QBrush(QColor("#0A84FF")))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(0, 0, 64, 64)
         painter.end()
         self.tray.setIcon(QIcon(QPixmap.fromImage(img)))
-
         self.tray_menu = QMenu()
-        a_show = QAction(self._("show_window_tray_menu"), self)
+        a_show = QAction(self._("show_window"), self)
         a_show.triggered.connect(self.show)
-        a_exit = QAction(self._("exit_tray_menu"), self)
+        a_workshop = QAction(self._("browse_workshop"), self)
+        a_workshop.triggered.connect(lambda: (self.show(), self._switch_tab(1)))
+        a_exit = QAction(self._("quit"), self)
         a_exit.triggered.connect(self.quit_app)
         self.tray_menu.addAction(a_show)
+        self.tray_menu.addAction(a_workshop)
+        self.tray_menu.addSeparator()
         self.tray_menu.addAction(a_exit)
-
         self.tray.setContextMenu(self.tray_menu)
         self.tray.show()
 
@@ -1308,15 +2064,12 @@ class WallpaperApp(QMainWindow):
             self.quit_app()
 
     def quit_app(self):
-        logging.info("Exiting application...")
         self.stop_wallpapers()
         if hasattr(self, 'watcher'):
             self.watcher.stop()
-
-        # Force kill any remaining backend processes to ensure clean exit
         self.kill_external_wallpapers()
-
         QApplication.quit()
+
 
 if __name__ == "__main__":
     logging.basicConfig(format='[%(asctime)s] [%(levelname)s]:  %(message)s')
@@ -1324,8 +2077,8 @@ if __name__ == "__main__":
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
     window = WallpaperApp()
-    parser = argparse.ArgumentParser(description="A simple gui for linux-wallpaperengine")
-    parser.add_argument("--background", action="store_true", help="Start the GUI minimized to the tray")
+    parser = argparse.ArgumentParser(description="Open Wallpaper Engine for Linux")
+    parser.add_argument("--background", action="store_true", help="Start minimized to tray")
     args = parser.parse_args()
     if not args.background:
         window.show()
