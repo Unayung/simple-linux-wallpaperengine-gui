@@ -146,6 +146,37 @@ locales/               # i18n translation files (en, zh-TW, de, es, fr, ru, uk)
 
 - **[Open Wallpaper Engine for macOS](https://github.com/Unayung/wallpaper-engine-mac)** — Our patched macOS version with scene wallpaper rendering and web wallpaper fixes. The Workshop integration and UI design in this Linux version were ported from it.
 
+## 🤖 LLM Agent Installation
+
+If you're an AI coding agent (Claude Code, Codex, etc.) setting this up for a user:
+
+```bash
+# Arch / Manjaro (recommended)
+yay -S simple-linux-wallpaperengine-gui-git
+
+# Or manual install on any distro
+# 1. Install backend first
+# See https://github.com/Unayung/linux-wallpaperengine
+
+# 2. Install GUI dependencies
+pip install PyQt6 requests
+
+# 3. Clone and run
+git clone https://github.com/Unayung/simple-linux-wallpaperengine-gui.git
+cd simple-linux-wallpaperengine-gui
+chmod +x install.sh && ./install.sh
+./run_gui.sh
+```
+
+**Key notes for agents:**
+- Backend `linux-wallpaperengine` must be installed and in PATH first
+- Steam + Wallpaper Engine ownership required for Workshop downloads
+- `steamcmd` needed for Workshop tab (`yay -S steamcmd` on Arch)
+- Steam Web API key needed for search (free at steamcommunity.com/dev/apikey)
+- Auto-scans `~/.local/share/Steam`, `~/.var/app/com.valvesoftware.Steam`, `~/snap/steam` for wallpapers
+- Start minimized: `./run_gui.sh --background`
+- Config stored in `~/.config/simple-linux-wallpaperengine-gui/`
+
 ## Credits
 
 - Backend: [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine) by Almamu
