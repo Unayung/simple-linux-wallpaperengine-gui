@@ -175,5 +175,11 @@
     "quit": "Quit",
     "select_steamcmd": "Select steamcmd executable",
     "select_wallpaper_folder": "Select wallpaper folder",
-    "wallpaper_engine": "Wallpaper Engine"
+    "wallpaper_engine": "Wallpaper Engine",
+    "dependency_required_title": "Dependency Required",
+    "dependency_required_msg": "This wallpaper requires another workshop item (ID: {dep_id}) to work.\n\nWould you like to download it now?",
+    "downloading_dependency": "Downloading dependency {dep_id}...",
+    "steam_login_needed_title": "Steam Login Needed",
+    "steam_login_needed_msg": "Please log in to Steam in the Workshop tab first to download the dependency.",
+    "dependency_resolved": "Dependency resolved, launching wallpaper..."
 }

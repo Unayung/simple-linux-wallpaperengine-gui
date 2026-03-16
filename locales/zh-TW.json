@@ -175,5 +175,11 @@
     "quit": "結束",
     "select_steamcmd": "選擇 steamcmd 執行檔",
     "select_wallpaper_folder": "選擇桌布資料夾",
-    "wallpaper_engine": "桌布引擎"
+    "wallpaper_engine": "桌布引擎",
+    "dependency_required_title": "需要依賴項目",
+    "dependency_required_msg": "此桌布需要另一個工作坊項目（ID: {dep_id}）才能運作。\n\n是否立即下載？",
+    "downloading_dependency": "正在下載依賴項目 {dep_id}...",
+    "steam_login_needed_title": "需要 Steam 登入",
+    "steam_login_needed_msg": "請先在工作坊分頁登入 Steam 帳號以下載依賴項目。",
+    "dependency_resolved": "依賴項目已解析，正在啟動桌布..."
 }

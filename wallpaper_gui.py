@@ -21,10 +21,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QStyledItemDelegate, QStyle, QStyleOptionSlider, QFileDialog,
                              QScrollArea, QGridLayout, QSplitter, QTabBar, QToolButton,
                              QSpacerItem)
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer, QRect, QPropertyAnimation, QEasingCurve, QVariant, QUrl
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QObject, QTimer, QRect, QPropertyAnimation, QEasingCurve, QVariant, QUrl
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QImage, QAction, QColor, QPainter, QDesktopServices
 from process_manager import WallpaperProcessManager
 from steamcmd_service import SteamCmdService, DownloadStatus
+from dependency_resolver import resolve_wallpaper, get_dependency_id, read_project_json, find_workshop_item
 from workshop_api import (WorkshopItem, SortOrder,
                           CONTENT_RATING_TAGS, TYPE_TAGS, GENRE_TAGS,
                           search_items, NoAPIKeyError, InvalidAPIKeyError, WorkshopAPIError)
@@ -171,19 +172,36 @@ QStatusBar { background: #1a1a1a; color: #666; font-size: 11px; border-top: 1px 
 
 # ── Helper Classes ──────────────────────────────────────────────────────────
 
-class Worker(QObject):
-    finished = pyqtSignal(object)
-    def __init__(self, func, *args, **kwargs):
-        super().__init__()
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-    def run(self):
-        try:
-            result = self.func(*self.args, **self.kwargs)
-        except Exception as e:
-            result = e
-        self.finished.emit(result)
+class AsyncTask:
+    """Run a function in a background thread and deliver the result on the main thread.
+    Uses ThreadPoolExecutor + QTimer polling to avoid cross-thread signal crashes on Python 3.14."""
+    _executor = None
+
+    @classmethod
+    def _get_executor(cls):
+        if cls._executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            cls._executor = ThreadPoolExecutor(max_workers=4)
+        return cls._executor
+
+    def __init__(self, func, *args, callback=None, **kwargs):
+        from concurrent.futures import Future
+        self._callback = callback
+        self._future = self._get_executor().submit(func, *args, **kwargs)
+        self._timer = QTimer()
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._check)
+        self._timer.start()
+
+    def _check(self):
+        if self._future.done():
+            self._timer.stop()
+            try:
+                result = self._future.result()
+            except Exception as e:
+                result = e
+            if self._callback:
+                self._callback(result)
 
 class I18n:
     def __init__(self):
@@ -246,56 +264,64 @@ class WallpaperDelegate(QStyledItemDelegate):
 
 
 class WallpaperChangeHandler(FileSystemEventHandler):
-    def __init__(self, signal):
-        self.signal = signal
+    """Receives file system events from watchdog (non-Qt thread).
+    Sets a flag instead of emitting a signal to avoid Qt thread-safety crash."""
+    def __init__(self):
+        self._active = True
+        self._changed = False
     def on_any_event(self, event):
-        if event.is_directory:
+        if event.is_directory or not self._active:
             return
-        self.signal.emit()
+        self._changed = True
 
 
 class LibraryWatcher(QObject):
     library_changed = pyqtSignal()
-    _raw_change = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.observer = Observer()
-        self.handler = WallpaperChangeHandler(self._raw_change)
+        self._observer = None
+        self.handler = WallpaperChangeHandler()
         self.watched_paths = set()
-        self.timer = QTimer()
-        self.timer.setSingleShot(True)
-        self.timer.setInterval(2000)
-        self.timer.timeout.connect(self.library_changed.emit)
-        self._raw_change.connect(self.on_raw_change)
+        # Debounce timer: checks the flag periodically from the main thread
+        self._poll_timer = QTimer()
+        self._poll_timer.setInterval(2000)
+        self._poll_timer.timeout.connect(self._check_changes)
+        self._poll_timer.start()
 
-    def on_raw_change(self):
-        self.timer.start()
+    def _check_changes(self):
+        if self.handler._changed:
+            self.handler._changed = False
+            self.library_changed.emit()
+
+    def _stop_observer(self):
+        if self._observer is not None and self._observer.is_alive():
+            self.handler._active = False
+            self._observer.stop()
+            self._observer.join(timeout=3)
+            self._observer = None
 
     def update_watches(self, directories):
         new_paths = set(directories)
         if new_paths == self.watched_paths:
             return
-        if self.observer.is_alive():
-            self.observer.stop()
-            self.observer.join()
-        self.observer = Observer()
+        self._stop_observer()
+        self.handler._active = True
+        self._observer = Observer()
         self.watched_paths = new_paths
         for d in directories:
             if os.path.isdir(d):
                 try:
-                    self.observer.schedule(self.handler, d, recursive=True)
+                    self._observer.schedule(self.handler, d, recursive=True)
                 except Exception as e:
                     print(f"Failed to watch {d}: {e}")
         try:
-            self.observer.start()
+            self._observer.start()
         except Exception as e:
             print(f"Failed to start observer: {e}")
 
     def stop(self):
-        if self.observer.is_alive():
-            self.observer.stop()
-            self.observer.join()
+        self._stop_observer()
 
 
 class ClickableSlider(QSlider):
@@ -353,6 +379,12 @@ class WallpaperApp(QMainWindow):
 
         self.steam_cmd.login_state_changed.connect(self._on_steam_login_changed)
         self.steam_cmd.download_updated.connect(self._on_download_updated)
+
+        # Auto-attempt cached Steam login
+        saved_user = self.config.get("steam_username", "")
+        if saved_user and self.steam_cmd.is_installed and not self.steam_cmd.is_logged_in:
+            self.steam_username_input.setText(saved_user)
+            self.steam_cmd.login_cached(saved_user)
 
         self.wallpaper_proc_manager = WallpaperProcessManager()
         self.wallpaper_watchdog = QTimer()
@@ -467,8 +499,17 @@ class WallpaperApp(QMainWindow):
         # Force style refresh
         self.tab_installed.setStyleSheet("")
         self.tab_workshop.setStyleSheet("")
-        # Show/hide preview panel
-        self.preview_panel.setVisible(index == 0)
+        # Show/hide preview panel; give left panel full width on non-installed tabs
+        show_preview = index == 0
+        self.preview_panel.setVisible(show_preview)
+        total = self.main_splitter.width()
+        if show_preview:
+            self.main_splitter.setSizes([total - 320, 320])
+        else:
+            self.main_splitter.setSizes([total, 0])
+        # Re-render workshop grid when switching to workshop tab
+        if index == 1 and self.workshop_items:
+            QTimer.singleShot(0, self._render_ws_grid)
 
     # ── Installed Page ──────────────────────────────────────────────────
 
@@ -1206,9 +1247,11 @@ class WallpaperApp(QMainWindow):
                 self.steam_guard_input.show()
         elif self.steam_cmd.is_logged_in:
             self.steam_login_error.hide()
+            self.config["steam_username"] = self.steam_cmd.username
+            self.save_config()
             self._update_workshop_view_state()
             if not self.workshop_items:
-                self._ws_search()
+                QTimer.singleShot(200, self._ws_search)
 
     def _save_api_key_from(self, key_text):
         key = key_text.strip()
@@ -1252,15 +1295,7 @@ class WallpaperApp(QMainWindow):
                 sort_order=self.workshop_sort_order,
                 page=self.workshop_page_num,
             )
-        self._ws_thread = QThread()
-        self._ws_worker = Worker(_search)
-        self._ws_worker.moveToThread(self._ws_thread)
-        self._ws_thread.started.connect(self._ws_worker.run)
-        self._ws_worker.finished.connect(lambda r: self._ws_search_done(r, append))
-        self._ws_worker.finished.connect(self._ws_thread.quit)
-        self._ws_worker.finished.connect(self._ws_worker.deleteLater)
-        self._ws_thread.finished.connect(self._ws_thread.deleteLater)
-        self._ws_thread.start()
+        self._ws_task = AsyncTask(_search, callback=lambda r: self._ws_search_done(r, append))
 
     def _ws_search_done(self, result, append=False):
         self.btn_load_more.setEnabled(True)
@@ -1276,23 +1311,35 @@ class WallpaperApp(QMainWindow):
             if not self.workshop_items:
                 self.ws_results_stack.setCurrentIndex(0)
                 return
-            self._render_ws_grid()
+            # Switch to results page first so the scroll area gets laid out at full width
             self.ws_results_stack.setCurrentIndex(3)
             self.btn_load_more.setVisible(len(result) >= 20)
+            # Defer grid render so layout settles
+            QTimer.singleShot(0, self._render_ws_grid)
 
     def _render_ws_grid(self):
-        old = self.ws_grid_widget
+        # Ensure layout is finalized before measuring; defer if viewport has no real width yet
+        vw = self.ws_scroll.viewport().width()
+        if vw < 100 or self.content_stack.currentIndex() != 1:
+            QTimer.singleShot(0, self._render_ws_grid)
+            return
+        old = self.ws_scroll.takeWidget()
         self.ws_grid_widget = QWidget()
         self.ws_grid_widget.setStyleSheet("background: transparent;")
         grid = QGridLayout(self.ws_grid_widget)
-        grid.setSpacing(12)
-        grid.setContentsMargins(4, 4, 4, 4)
-        cols = max(1, (self.width() - 400) // 220)
+        grid.setSpacing(10)
+        grid.setContentsMargins(8, 8, 8, 8)
+        card_w = 200
+        spacing = 10
+        margins = 16
+        avail = vw - margins
+        cols = max(1, (avail + spacing) // (card_w + spacing))
         for i, item in enumerate(self.workshop_items):
             card = self._make_ws_card(item)
             grid.addWidget(card, i // cols, i % cols)
         self.ws_scroll.setWidget(self.ws_grid_widget)
-        old.deleteLater()
+        if old:
+            old.deleteLater()
 
     def _make_ws_card(self, item: WorkshopItem) -> QWidget:
         card = QFrame()
@@ -1373,10 +1420,6 @@ class WallpaperApp(QMainWindow):
                     return resp.read()
             except:
                 return None
-        thread = QThread()
-        worker = Worker(_fetch)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         def _done(data):
             if data:
                 img = QImage()
@@ -1384,12 +1427,7 @@ class WallpaperApp(QMainWindow):
                 pm = QPixmap.fromImage(img)
                 self._workshop_image_cache[url] = pm
                 label.setPixmap(pm.scaled(200, 112, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
-        worker.finished.connect(_done)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._img_threads.append(thread)
-        thread.start()
+        self._img_threads.append(AsyncTask(_fetch, callback=_done))
 
     def _download_ws_item(self, wid):
         dirs = self.get_steam_workshop_dirs()
@@ -1480,7 +1518,8 @@ class WallpaperApp(QMainWindow):
                         with open(proj_self, 'r', encoding='utf-8') as f:
                             data = json.load(f)
                             item_id = os.path.basename(w_dir)
-                            wallpapers.append({"title": data.get("title", "Untitled"), "id": item_id, "path": w_dir, "preview": data.get("preview")})
+                            dep_id = get_dependency_id(data)
+                            wallpapers.append({"title": data.get("title", "Untitled"), "id": item_id, "path": w_dir, "preview": data.get("preview"), "dependency": dep_id})
                             seen.add(item_id)
                     except: pass
                 for item_id in os.listdir(w_dir):
@@ -1491,7 +1530,8 @@ class WallpaperApp(QMainWindow):
                         try:
                             with open(proj, 'r', encoding='utf-8') as f:
                                 data = json.load(f)
-                                wallpapers.append({"title": data.get("title", "Untitled"), "id": item_id, "path": path, "preview": data.get("preview")})
+                                dep_id = get_dependency_id(data)
+                                wallpapers.append({"title": data.get("title", "Untitled"), "id": item_id, "path": path, "preview": data.get("preview"), "dependency": dep_id})
                                 seen.add(item_id)
                         except: pass
             except: pass
@@ -1501,30 +1541,14 @@ class WallpaperApp(QMainWindow):
         self.status_bar.showMessage(self._("scanning_wallpapers"))
         self.btn_scan.setEnabled(False)
         self.search_input.clear()
-        self.thread = QThread()
-        self.worker = Worker(self.scan_logic)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.scan_finished)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
+        self._scan_task = AsyncTask(self.scan_logic, callback=self.scan_finished)
 
     def manual_scan(self):
         directory = QFileDialog.getExistingDirectory(self, self._("select_wallpaper_folder"))
         if directory:
             self.status_bar.showMessage(self._("scanning_folder"))
             self.btn_scan.setEnabled(False)
-            self.thread = QThread()
-            self.worker = Worker(self.scan_logic, manual_dir=directory)
-            self.worker.moveToThread(self.thread)
-            self.thread.started.connect(self.worker.run)
-            self.worker.finished.connect(self.scan_finished)
-            self.worker.finished.connect(self.thread.quit)
-            self.worker.finished.connect(self.worker.deleteLater)
-            self.thread.finished.connect(self.thread.deleteLater)
-            self.thread.start()
+            self._scan_task = AsyncTask(self.scan_logic, manual_dir=directory, callback=self.scan_finished)
 
     def scan_finished(self, result):
         if isinstance(result, Exception):
@@ -1612,10 +1636,11 @@ class WallpaperApp(QMainWindow):
 
     def filter_wallpapers(self, text):
         query = text.lower()
-        if query:
-            self.watcher.timer.stop()
-        else:
-            self.watcher.timer.start()
+        if hasattr(self, 'watcher'):
+            if query:
+                self.watcher.timer.stop()
+            else:
+                self.watcher.timer.start()
         for i in range(self.list_wallpapers.count()):
             item = self.list_wallpapers.item(i)
             data = item.data(Qt.ItemDataRole.UserRole)
@@ -1784,15 +1809,7 @@ class WallpaperApp(QMainWindow):
             return
         self.status_bar.showMessage(self._("loading_properties_status"))
         self.btn_load_props.setEnabled(False)
-        self.props_thread = QThread()
-        self.props_worker = Worker(self.list_properties_logic, wid)
-        self.props_worker.moveToThread(self.props_thread)
-        self.props_thread.started.connect(self.props_worker.run)
-        self.props_worker.finished.connect(self.load_properties_finished)
-        self.props_worker.finished.connect(self.props_thread.quit)
-        self.props_worker.finished.connect(self.props_worker.deleteLater)
-        self.props_thread.finished.connect(self.props_thread.deleteLater)
-        self.props_thread.start()
+        self._props_task = AsyncTask(self.list_properties_logic, wid, callback=self.load_properties_finished)
 
     def load_properties_finished(self, result):
         if isinstance(result, Exception):
@@ -1828,6 +1845,46 @@ class WallpaperApp(QMainWindow):
     def kill_external_wallpapers(self):
         self.wallpaper_proc_manager.kill_external("linux-wallpaperengine")
 
+    def _resolve_wallpaper_path(self, wallpaper_id: str) -> tuple[str, bool]:
+        """Resolve wallpaper ID to a launchable path, handling dependencies.
+
+        Returns (path_to_use, was_resolved). If a dependency is missing and
+        the user declines to download, returns (wallpaper_id, False).
+        """
+        # Find the wallpaper's full path
+        workshop_dirs = self.get_steam_workshop_dirs()
+        wallpaper_path = find_workshop_item(wallpaper_id, workshop_dirs)
+        if not wallpaper_path:
+            return wallpaper_id, False  # Let the engine try to resolve it
+
+        resolved_path, missing_dep = resolve_wallpaper(wallpaper_path, workshop_dirs)
+        if missing_dep:
+            from PyQt6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self, self._("dependency_required_title"),
+                self._("dependency_required_msg", dep_id=missing_dep),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                if self.steam_cmd.is_logged_in:
+                    dest = list(workshop_dirs)[0] if workshop_dirs else os.path.expanduser(
+                        "~/.local/share/Steam/steamapps/workshop/content/431960")
+                    os.makedirs(dest, exist_ok=True)
+                    self.steam_cmd.download_workshop_item(missing_dep, dest)
+                    self.status_bar.showMessage(
+                        self._("downloading_dependency", dep_id=missing_dep))
+                else:
+                    QMessageBox.information(
+                        self, self._("steam_login_needed_title"),
+                        self._("steam_login_needed_msg"))
+                return wallpaper_id, False
+            return wallpaper_id, False
+
+        if resolved_path != wallpaper_path:
+            logging.info("Resolved dependency wallpaper %s -> %s", wallpaper_id, resolved_path)
+            return resolved_path, True
+        return wallpaper_id, False
+
     def run_wallpaper(self):
         if not shutil.which("linux-wallpaperengine"):
             from PyQt6.QtWidgets import QMessageBox
@@ -1843,7 +1900,9 @@ class WallpaperApp(QMainWindow):
             cmd.extend(['--window', geom])
         else:
             cmd.extend(['--screen-root', screen_name])
-        cmd.extend(['--bg', self.wp_id_input.text()])
+        bg_id = self.wp_id_input.text()
+        resolved_path, _ = self._resolve_wallpaper_path(bg_id)
+        cmd.extend(['--bg', resolved_path])
         if self.chk_silent.isChecked(): cmd.append('--silent')
         elif self.slider_volume.value() != 15: cmd.extend(['--volume', str(self.slider_volume.value())])
         if self.chk_no_automute.isChecked(): cmd.append('--noautomute')
@@ -2055,6 +2114,13 @@ class WallpaperApp(QMainWindow):
         self.tray_menu.addAction(a_exit)
         self.tray.setContextMenu(self.tray_menu)
         self.tray.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-flow workshop grid when width changes
+        if (hasattr(self, 'content_stack') and self.content_stack.currentIndex() == 1
+                and self.workshop_items):
+            self._render_ws_grid()
 
     def closeEvent(self, event):
         if self.tray.isVisible():

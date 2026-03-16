@@ -24,8 +24,7 @@ A modern, feature-rich GUI for [linux-wallpaperengine](https://github.com/Almamu
 
 ## Screenshots
 
-<img width="2560" height="1440" alt="Pasted image" src="https://github.com/user-attachments/assets/15c6dc78-f51b-4c1b-aeb1-f2bad88bc898" />
-<img width="2560" height="1440" alt="Pasted image (2)" src="https://github.com/user-attachments/assets/d36990b8-641a-44fe-b4ff-ca582d9494da" />
+![Installed Tab - Wallpaper Browser](screenshots/installed-tab.png)
 
 ## Installation (Arch Linux / Manjaro)
 
