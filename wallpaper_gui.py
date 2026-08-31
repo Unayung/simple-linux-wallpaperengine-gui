@@ -230,8 +230,9 @@ class WallpaperDelegate(QStyledItemDelegate):
         self.scales = {}
         self.current_scales = {}
         self.timer = QTimer()
+        self.timer.setInterval(16)
         self.timer.timeout.connect(self.update_animations)
-        self.timer.start(10)
+        # started by paint() only while a hover animation is in flight
 
     def update_animations(self):
         changed = False
@@ -244,7 +245,9 @@ class WallpaperDelegate(QStyledItemDelegate):
                 else:
                     self.current_scales[index_ptr] = max(curr - step, target)
                 changed = True
-        if changed and self.parent():
+        if not changed:
+            self.timer.stop()
+        elif self.parent():
             self.parent().viewport().update()
 
     def paint(self, painter, option, index):
@@ -255,6 +258,8 @@ class WallpaperDelegate(QStyledItemDelegate):
         is_hovered = option.state & QStyle.StateFlag.State_MouseOver
         self.scales[idx_id] = 1.08 if is_hovered else 1.0
         scale = self.current_scales.get(idx_id, 1.0)
+        if abs(scale - self.scales[idx_id]) > 0.001 and not self.timer.isActive():
+            self.timer.start()
         if scale > 1.0:
             painter.translate(option.rect.center())
             painter.scale(scale, scale)
@@ -269,8 +274,15 @@ class WallpaperChangeHandler(FileSystemEventHandler):
     def __init__(self):
         self._active = True
         self._changed = False
+    # A running wallpaper reads its assets constantly, and watchdog's
+    # mask includes IN_OPEN/IN_CLOSE_NOWRITE, so reacting to those rescans the
+    # whole library every 2s forever. Only add/remove/rename means "library changed".
+    _RELEVANT = ("created", "deleted", "moved", "modified")
+
     def on_any_event(self, event):
         if event.is_directory or not self._active:
+            return
+        if event.event_type not in self._RELEVANT:
             return
         self._changed = True
 
@@ -1638,9 +1650,9 @@ class WallpaperApp(QMainWindow):
         query = text.lower()
         if hasattr(self, 'watcher'):
             if query:
-                self.watcher.timer.stop()
+                self.watcher._poll_timer.stop()
             else:
-                self.watcher.timer.start()
+                self.watcher._poll_timer.start()
         for i in range(self.list_wallpapers.count()):
             item = self.list_wallpapers.item(i)
             data = item.data(Qt.ItemDataRole.UserRole)
